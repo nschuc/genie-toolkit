@@ -138,7 +138,7 @@ interface GenericSentenceGeneratorOptions {
     rootSymbol ?: string;
     targetPruningSize : number;
     maxDepth : number;
-    maxConstants : number;
+    maxConstants? : number;
     debug : number;
     rng : () => number;
 
@@ -334,7 +334,7 @@ export default class SentenceGenerator<ContextType, RootOutputType> extends even
         attributes.forConstant = true;
         for (const constant of ThingTalkUtils.createConstants(token, type, this._options.maxConstants || DEFAULT_MAX_CONSTANTS)) {
             const sentencepiece = constant.display;
-            const combiner = () => new Derivation(constant.value, List.singleton(sentencepiece), null, attributes.priority || 0);
+            const combiner = () => new Derivation(constant.value, List.singleton(sentencepiece), null, attributes.priority || 0, { children: [{ nonTerminal: constant.value.toString() }], nonTerminal: symbol });
             this._addRuleInternal(symbolId, [sentencepiece], combiner, attributes);
         }
     }
@@ -733,7 +733,7 @@ export default class SentenceGenerator<ContextType, RootOutputType> extends even
         for (const token in constants) {
             for (const symbolId of this._constantMap.get(token)) {
                 for (const constant of constants[token]) {
-                    const combiner = () => new Derivation(constant.value, List.singleton(constant.display), null, attributes.priority);
+                    const combiner = () => new Derivation(constant.value, List.singleton(constant.display), null, attributes.priority, { children: [{ nonTerminal: token }], nonTerminal: "poop"});
                     this._addRuleInternal(symbolId, [constant.display], combiner, attributes);
                     if (this._options.debug >= LogLevel.EVERYTHING)
                         console.log(`added temporary rule NT[${this._nonTermList[symbolId]}] -> ${constant.display}`);
@@ -1121,6 +1121,56 @@ export default class SentenceGenerator<ContextType, RootOutputType> extends even
 
         this._progress = 1;
     }
+
+    private _parsePartialDerivation(partial: string[]) {
+        let re = /NT\[([a-zA-Z_0-9$]+)\]/;
+
+        let tokens = partial.map((t) => {
+            let match = re.exec(t);
+            if (match) {
+                let symbol = match[1];
+                let nonTerm = new NonTerminal(symbol);
+                nonTerm.index = this._lookupNonTerminal(symbol);
+                return nonTerm;
+            }
+            return t;
+        });
+        return tokens;
+    }
+
+    nextStepExpansion(sentence: string[], expandAll: boolean = false) {
+        let expansion = this._parsePartialDerivation(sentence);
+        const anyNonTerm = expansion.some((x) => x instanceof NonTerminal);
+
+        if (!anyNonTerm) {
+            return;
+        }
+
+        let nextExpansions = [];
+
+        for (let i = 0; i < expansion.length; i++) {
+            let token = expansion[i];
+
+            if (token instanceof NonTerminal) {
+                let index = token.index;
+
+                for (let rule of this._rules[index]) {
+                    let replaced = [
+                    ...expansion.slice(0, i),
+                    ...rule.expansion,
+                    ...expansion.slice(i + 1),
+                    ];
+
+                    nextExpansions.push(replaced);
+                }
+                if (!expandAll) {
+                    break
+                }
+            }
+        }
+
+        return nextExpansions;
+    }
 }
 
 function computeWorstCaseGenSize(charts : Charts,
@@ -1311,7 +1361,7 @@ function expandRuleExhaustive(charts : Charts,
                 //console.log('combine: ' + choices.join(' ++ '));
                 //console.log('depths: ' + depths);
                 if (!(coinProbability < 1.0) || coin(coinProbability, rng)) {
-                    const v = combiner(assignChoices(choices, rng), rule.priority);
+                    const v = combiner(assignChoices(choices, rng), rule.priority, nonTermList[nonTermIndex]);
                     if (v !== null) {
                         actualGenSize ++;
                         if (actualGenSize < targetPruningSize / 2 &&
@@ -1441,7 +1491,7 @@ function expandRuleSample(charts : Charts,
                     choices[i] = uniform(charts[0][currentExpansion.index].sampled, rng);
             }
 
-            const v = combiner(choices, rule.priority);
+            const v = combiner(choices, rule.priority, nonTermList[nonTermIndex]);
             if (v !== null) {
                 actualGenSize ++;
                 emit(v);
@@ -1619,7 +1669,7 @@ function expandRuleSample(charts : Charts,
             }
         }
 
-        const v = combiner(choices, rule.priority);
+        const v = combiner(choices, rule.priority, nonTermList[nonTermIndex]);
         if (v !== null) {
             actualGenSize ++;
             emit(v);
@@ -1648,7 +1698,7 @@ function expandRule(charts : Charts,
 
     if (!anyNonTerm) {
         if (depth === 0) {
-            const deriv = combiner(assignChoices(expansion, rng), rule.priority);
+            const deriv = combiner(assignChoices(expansion, rng), rule.priority, nonTermList[nonTermIndex]);
             if (deriv !== null)
                 emit(deriv);
         }

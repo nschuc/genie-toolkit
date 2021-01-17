@@ -1,0 +1,209 @@
+// -*- mode: js; indent-tabs-mode: nil; js-basic-offset: 4 -*-
+//
+// This file is part of Genie
+//
+// Copyright 2019-2020 The Board of Trustees of the Leland Stanford Junior University
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Giovanni Campagna <gcampagn@cs.stanford.edu>
+
+import * as argparse from 'argparse';
+import seedrandom from 'seedrandom';
+import * as fs from 'fs';
+import * as Tp from 'thingpedia';
+
+import SentenceGenerator, { SentenceGeneratorOptions } from "../lib/sentence-generator/generator";
+import { ActionSetFlag } from './lib/argutils';
+import JsonDatagramSocket from '../lib/utils/json_datagram_socket';
+
+export function initArgparse(subparsers : argparse.SubParser) {
+    const parser = subparsers.add_parser("partial-completions", {
+      add_help: true,
+      description: "Generate a new synthetic dataset, given a template file.",
+    });
+    parser.add_argument("-l", "--locale", {
+      required: false,
+      default: "en-US",
+      help: `BGP 47 locale tag of the language to generate (defaults to 'en-US', English)`,
+    });
+    parser.add_argument("--thingpedia", {
+      required: false,
+      help: "Path to ThingTalk file containing class definitions.",
+    });
+    parser.add_argument("--entities", {
+      required: false,
+      help: "Path to JSON file containing entity type definitions.",
+    });
+    parser.add_argument("--dataset", {
+      required: false,
+      help: "Path to file containing primitive templates, in ThingTalk syntax.",
+    });
+    parser.add_argument("--template", {
+      required: true,
+      nargs: "+",
+      help: "Path to file containing construct templates, in Genie syntax.",
+    });
+    parser.add_argument("--set-flag", {
+      required: false,
+      nargs: 1,
+      action: ActionSetFlag,
+      const: true,
+      metavar: "FLAG",
+      help: "Set a flag for the construct template file.",
+    });
+    parser.add_argument("--unset-flag", {
+      required: false,
+      nargs: 1,
+      action: ActionSetFlag,
+      const: false,
+      metavar: "FLAG",
+      help: "Unset (clear) a flag for the construct template file.",
+    });
+    parser.add_argument("--maxdepth", {
+      required: false,
+      type: Number,
+      default: 5,
+      help: "Maximum depth of sentence generation",
+    });
+    parser.add_argument("--target-pruning-size", {
+      required: false,
+      type: Number,
+      default: 100000,
+      help:
+        "Approximate target size of the generate dataset, for each $root rule and each depth",
+    });
+
+    parser.add_argument("--debug", {
+      nargs: "?",
+      const: 1,
+      default: 0,
+      help:
+        "Enable debugging. Can be specified with an argument between 0 and 5 to choose the verbosity level.",
+    });
+    parser.add_argument("--no-debug", {
+      const: 0,
+      action: "store_const",
+      dest: "debug",
+      help: "Disable debugging.",
+    });
+    parser.add_argument("--no-progress", {
+      action: "store_false",
+      dest: "progress",
+      default: true,
+      help: "Disable the progress bar (implied if --debug is passed).",
+    });
+    parser.add_argument("--random-seed", {
+      default: "almond is awesome",
+      help: "Random seed",
+    });
+    parser.add_argument("--white-list", {
+      required: false,
+      help: `List of functions to include, split by comma (no space).`,
+    });
+    parser.add_argument("--id-prefix", {
+      required: false,
+      default: "",
+      help:
+        "Prefix to add to all sentence IDs (useful to combine multiple datasets).",
+    });
+  }
+
+export async function execute(args: any) {
+    let tpClient : Tp.FileClient | undefined = undefined;
+    if (args.thingpedia) tpClient = new Tp.FileClient(args);
+
+    const options : SentenceGeneratorOptions<unknown> = {
+      rng: seedrandom.alea(args.random_seed),
+      locale: args.locale,
+      flags: args.flags || {},
+      templateFiles: args.template,
+      thingpediaClient: tpClient,
+      targetPruningSize: args.target_pruning_size,
+      maxDepth: args.maxdepth,
+      debug: args.debug,
+      whiteList: args.white_list,
+      contextual: false,
+    };
+
+    const generator = new SentenceGenerator(options);
+    await generator.initialize();
+    generator.finalize();
+
+    let _stream = new JsonDatagramSocket(process.stdin!, process.stdout!, 'utf8');
+
+    _stream.on('error', (e: any) => {
+      console.error('Genie Error:', e)
+    });
+
+    _stream.on('data', (msg: any) => {
+      let expansions = generator.nextStepExpansion(msg.derivation);
+      _stream.write({
+        candidates: expansions?.map((e) => {
+          return e.map(token => token.toString())
+        }),
+      });
+    });
+
+    await new Promise((resolve, reject) => {
+      process.on('SIGINT', resolve);
+      process.on('SIGTERM', resolve);
+    });
+
+  }
+
+// type Generator = SentenceGenerator<undefined, ThingTalkUtils.Input>;
+
+// class CommandLineHandler {
+
+//     private _rl : readline.Interface;
+//     private _generator: Generator: 
+//     private expansions : any;
+
+//   constructor(rl : readline.Interface, options: any) {
+  
+//     this._rl = rl;
+//     this._rl.on("line", this._onLine.bind(this));
+//     this._rl.on("SIGINT", this._quit.bind(this));
+//     this._generator = new SentenceGenerator(options);
+//   }
+
+//   async start() {
+//     await this._generator.initialize();
+//     this._generator.finalize();
+//     const startSymbol = "$root";
+//     this.expansions = this._generator.nextStepExpansion(startSymbol)
+//     this.printExpansions();
+//     this._rl.prompt();
+//   }
+
+//   printExpansions() {
+//     console.log("Select an expansion");
+//     for (let i = 0; i < this.expansions.length; i++) {
+//       console.log(`${i}: ${this.expansions[i]}`);
+//     }
+//   }
+
+//   async _quit() {
+//     console.log("Bye\n");
+//     this._rl.close();
+//   }
+
+//   async _onLine(line) {
+//     let index = parseInt(line);
+//     let expansion = this.expansions[index];
+//     this.expansions = this._generator.nextStepExpansion(expansion.toString())
+//     this.printExpansions();
+//     this._rl.prompt();
+//   }
+// }

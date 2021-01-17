@@ -125,12 +125,20 @@ export function initArgparse(subparsers : argparse.SubParser) {
         default: '',
         help: 'Prefix to add to all sentence IDs (useful to combine multiple datasets).'
     });
+    parser.add_argument('--save-history', {
+        action: 'store_true',
+        dest: 'saveHistory',
+        default: false,
+        help: 'Include trace of rules used to generate utterance'
+    });
 }
 
 export async function execute(args : any) {
     let tpClient : Tp.FileClient|undefined = undefined;
+
     if (args.thingpedia)
         tpClient = new Tp.FileClient(args);
+
     const options = {
         rng: seedrandom.alea(args.random_seed),
         locale: args.locale,
@@ -142,7 +150,8 @@ export async function execute(args : any) {
         maxDepth: args.maxdepth,
         debug: args.debug,
         whiteList: args.white_list,
-        idPrefix: args.id_prefix
+        idPrefix: args.id_prefix,
+        saveHistory: args.saveHistory
     };
 
     const generator = new BasicSentenceGenerator(options);

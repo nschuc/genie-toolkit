@@ -87,7 +87,9 @@ const subcommands : { [key : string] : SubCommand } = {
 
     'auto-annotate-multiwoz': require('./auto-annotate-multiwoz'),
     'extract-predicted-slots': require('./extract-predicted-slots'),
-    'analyze-dialogue-annotations': require('./analyze-dialogue-annotations')
+    'analyze-dialogue-annotations': require('./analyze-dialogue-annotations'),
+
+    'partial-completions': require('./partial'),
 };
 
 async function main() {

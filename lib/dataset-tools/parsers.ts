@@ -43,6 +43,9 @@ export interface SentenceExample {
     // these two are used by almond-cloud, and we preserve in some cases
     type ?: string;
     utterance ?: string;
+
+    // tree of nonterminals used to generate utterance
+    history ?: string;
 }
 
 class DatasetStringifier extends Stream.Transform {
@@ -63,6 +66,8 @@ class DatasetStringifier extends Stream.Transform {
             buffer += ex.target_code;
         if (ex.prediction)
             buffer += '\t' + ex.prediction;
+        if (ex.history)
+            buffer += '\t' + ex.history;
         buffer += '\n';
         callback(null, buffer);
     }

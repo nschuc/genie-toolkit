@@ -49,6 +49,8 @@ interface BasicGeneratorOptions {
     thingpediaClient ?: Tp.BaseClient;
     onlyDevices ?: string[];
     whiteList ?: string;
+
+    saveHistory ?: boolean;
 }
 
 /**
@@ -62,6 +64,7 @@ class BasicSentenceGenerator extends stream.Readable {
     private _generator : SentenceGenerator<undefined, ThingTalkUtils.Input>;
     private _initialization : Promise<void>|null;
     private _i : number;
+    private _saveHistory : boolean;
 
     constructor(options : BasicGeneratorOptions) {
         super({ objectMode: true });
@@ -69,6 +72,7 @@ class BasicSentenceGenerator extends stream.Readable {
         this._locale = options.locale;
         this._langPack = I18n.get(options.locale);
         this._rng = options.rng;
+        this._saveHistory = options.saveHistory || false;
         this._generator = new SentenceGenerator({
             locale: options.locale,
             templateFiles: options.templateFiles,
@@ -124,6 +128,12 @@ class BasicSentenceGenerator extends stream.Readable {
         Utils.renumberEntities(tokenized, contextEntities);
         preprocessed = tokenized.tokens.join(' ');
 
+        let history = undefined;
+
+        if(this._saveHistory) {
+            JSON.stringify(derivation.history)
+        }
+
         let sequence;
         try {
             sequence = ThingTalkUtils.serializePrediction(program, [], tokenized.entities, {
@@ -143,7 +153,7 @@ class BasicSentenceGenerator extends stream.Readable {
         const flags = {
             synthetic: true
         };
-        this.push({ depth, id, flags, preprocessed, target_code: sequence.join(' ') });
+        this.push({ depth, id, flags, preprocessed, history, target_code: sequence.join(' ') });
     }
 }
 
