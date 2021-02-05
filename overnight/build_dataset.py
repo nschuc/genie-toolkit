@@ -8,54 +8,15 @@ import flatten
 import tqdm
 import itertools
 
-run_args = [
-    "--locale",
-    "en-US",
-    "--template",
-    "languages-dist/thingtalk/en/sempre.genie",
-    "--thingpedia",
-    "tutorial/overnight.tt",
-    "--dataset",
-    "tutorial/emptydataset.tt",
-    "--entities",
-    "tutorial/entities.json",
-    "--target-pruning-size",
-    "500",
-]
-
-
-def sample_random_utterance():
-    process = subprocess.Popen(
-        ["node", "dist/tool/genie.js", "partial-completions", *run_args],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-
-    candidate = "NT[$root]"
-
-    while True:
-        # Send
-        req = dict(derivation=candidate)
-        process.stdin.write(json.dumps(req).encode("utf-8"))
-        process.stdin.flush()
-
-        # Recv
-        stdout_data = process.stdout.readline()
-        resp = json.loads(stdout_data.decode())
-        candidates = resp["candidates"]
-
-        if not candidates:
-            print("Fully expanded!")
-            return
-
-        candidate = random.choice(candidates)
-        print(candidate)
-
-
 class PartialDerivationSampler:
-    def __init__(self):
+    def __init__(self, args: List[str]):
         self.proc = subprocess.Popen(
-            ["node", "dist/tool/genie.js", "partial-completions", *run_args],
+            [
+                "node",
+                "dist/tool/genie.js",
+                "partial-completions",
+                *args
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
         )
@@ -73,16 +34,16 @@ class PartialDerivationSampler:
         return candidates
 
 
-def run_genie():
+def rebuild_dataset(genie_args: List[str]):
     process = subprocess.Popen(
         [
             "node",
             "dist/tool/genie.js",
             "generate",
             "-o",
-            "tutorial/synthesized.tsv",
+            "overnight/synthesized.tsv",
             "--save-history",
-            *run_args,
+            *genie_args,
         ],
     )
     process.wait()
@@ -99,37 +60,51 @@ def load_dataset(path: Path):
     return flattened_ds
 
 
-def main(path: Optional[Path] = None, build_ds: bool = False):
-    if build_ds:
-        run_genie()
+def main(
+    synth_path: Optional[Path] = None,
+    validate: bool = False,
+    sample_negatives: bool = False,
+    genie_args: str = "",
+):
+    output_path = Path(__file__).parent / "guided-dataset.jsonl"
 
-    if path and path.exists():
-        flat_ds = load_dataset(path)
+    neg_sampler = PartialDerivationSampler(genie_args.split())
+
+    if sample_negatives and synth_path and synth_path.exists():
+        flat_ds = load_dataset(synth_path)
         print(f"there are {len(flat_ds)} partial derivations")
 
-        ds_neg = []
-        ds_pos = []
-        neg = PartialDerivationSampler()
-        for idx, sample in enumerate(tqdm.tqdm(flat_ds, desc="Sampling negatives from grammar")):
+        samples = []
+        for idx, sample in enumerate(
+            tqdm.tqdm(flat_ds, desc="Sampling negatives from grammar")
+        ):
             canonical, flat = sample
-            candidates = neg.next_step_candidates(flat)
+            candidates = neg_sampler.next_step_candidates(flat)
             if candidates:
                 negative = random.choice(candidates)
-                positive = flat_ds[idx+1][1]
+                positive = flat_ds[idx + 1][1]
 
-                ds_neg.append((canonical, ' '.join(flat), ' '.join(negative)))
-                ds_pos.append((canonical, ' '.join(flat), ' '.join(positive)))
+                samples.append(dict(canonical=canonical, pos=" ".join(positive), neg=" ".join(negative)))
 
-        pos_file = path.parent / "partials.pos.tsv"
-        neg_file = path.parent / "partials.neg.tsv"
+        output_path = Path(__file__).parent / "guided-dataset.jsonl"
 
-        with pos_file.open('w') as f:
-            for line in ds_pos:
-                f.write('\t'.join(line) + '\n')
+        with output_path.open("w") as f:
+            for line in samples:
+                f.write(json.dumps(line) + "\n")
 
-        with neg_file.open('w') as f:
-            for line in ds_neg:
-                f.write('\t'.join(line) + '\n')
+        print(f"Wrote dataset to {output_path}")
+
+    if validate:
+        with output_path.open("r") as f:
+            for line in f.readlines():
+                d = json.loads(line)
+                utt = d['pos'].split()
+                candidates = neg_sampler.next_step_candidates(utt)
+
+                if not candidates:
+                    print(d['canonical'])
+                    print(d['pos'])
+
 
 if __name__ == "__main__":
     typer.run(main)

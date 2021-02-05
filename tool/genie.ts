@@ -90,6 +90,7 @@ const subcommands : { [key : string] : SubCommand } = {
     'analyze-dialogue-annotations': require('./analyze-dialogue-annotations'),
 
     'partial-completions': require('./partial'),
+    'partial-predictions': require('./partial-predict'),
 };
 
 async function main() {

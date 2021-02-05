@@ -131,7 +131,7 @@ class BasicSentenceGenerator extends stream.Readable {
         let history = undefined;
 
         if(this._saveHistory) {
-            JSON.stringify(derivation.history)
+            history = JSON.stringify(derivation.history)
         }
 
         let sequence;
