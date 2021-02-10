@@ -251,12 +251,8 @@ class Derivation<ValueType> {
             return null;
         }
 
-        let newHistory : History = { 
-            nonTerminal: "replacePlaceholders",
-            children: [this.history]
-        }
-
-        return new Derivation(newValue, newSentence, newContext, newPriority, newHistory);
+        const deriv = replacement as Derivation<OtherArgType>;
+        return new Derivation(newValue, newSentence, newContext, newPriority, deriv.history);
     }
 
     static combine<ArgTypes extends unknown[], ResultType>(children : DerivationChildTuple<ArgTypes>,
