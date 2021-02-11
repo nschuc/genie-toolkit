@@ -139,10 +139,10 @@ export default class EnglishLanguagePack extends DefaultLanguagePack {
         if (program.isProgram && program.principal !== null)
             sentence = replaceMeMy(sentence);
 
-        if (!sentence.endsWith(' ?') && !sentence.endsWith(' !') && !sentence.endsWith(' .')) {
-            if ((forTarget === 'user' && coin(0.5, rng)) || forTarget === 'agent')
-                sentence = sentence.trim() + ' .';
-        }
+        // if (!sentence.endsWith(' ?') && !sentence.endsWith(' !') && !sentence.endsWith(' .')) {
+        //     if ((forTarget === 'user' && coin(0.5, rng)) || forTarget === 'agent')
+        //         sentence = sentence.trim() + ' .';
+        // }
         if (forTarget === 'user' && sentence.endsWith(' ?') && coin(0.5, rng))
             sentence = sentence.substring(0, sentence.length-2);
 

@@ -139,6 +139,7 @@ multidomain/manifest.tt: $(addsuffix /manifest.tt,$(all_experiments))
 	  --template $(geniedir)/languages-dist/$(template_file) \
 	  --thingpedia $*/manifest.tt --entities $*/entities.json --dataset $(dataset_file) \
 	  --target-pruning-size $(target_pruning_size) \
+	  --save-history \
 	  -o $@.tmp --no-debug $(generate_flags) --maxdepth $(maxdepth) \
 	  --random-seed $@ --id-prefix $*:
 	mv $@.tmp $@
@@ -150,7 +151,7 @@ shared-parameter-datasets.tsv:
 	  download-string-values --manifest $@ --append-manifest -d shared-parameter-datasets
 
 %/parameter-datasets.tsv : %/schema.trimmed.tt %/data.json shared-parameter-datasets.tsv
-	sed 's|\tshared-parameter-datasets|\t../shared-parameter-datasets|g' shared-parameter-datasets.tsv > $@
+	sed -e "s|$(echo -e '\t')shared-parameter-datasets|$(echo -e '\t')../shared-parameter-datasets|g" shared-parameter-datasets.tsv > $@
 	$(genie) make-string-datasets --manifest $@.local -d $*/parameter-datasets --thingpedia $*/schema.trimmed.tt --data $*/data.json --class-name $($(*)_class_name) --dataset schemaorg
 	cat $@.local >> $@
 	rm $@.local
