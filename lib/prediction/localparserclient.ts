@@ -18,6 +18,7 @@
 //
 // Author: Giovanni Campagna <gcampagn@cs.stanford.edu>
 
+import assert from 'assert';
 import * as Tp from 'thingpedia';
 import * as ThingTalk from 'thingtalk';
 
@@ -44,17 +45,18 @@ const NLG_QUESTION = 'what should the agent say ?';
 
 export interface LocalParserOptions {
     id ?: string;
-    nprocesses ?: number;
+    minibatchSize ?: number;
+    maxLatency ?: number;
 }
 
 function compareScore(a : PredictionCandidate, b : PredictionCandidate) : number {
     if (a.score === b.score)
         return 0;
     if (a.score === 'Infinity')
-        return 1;
-    if (b.score === 'Infinity')
         return -1;
-    return a.score - b.score;
+    if (b.score === 'Infinity')
+        return 1;
+    return b.score - a.score;
 }
 
 export default class LocalParserClient {
@@ -75,7 +77,7 @@ export default class LocalParserClient {
         this._locale = locale;
         this._langPack = I18n.get(locale);
         this._tokenizer = this._langPack.getTokenizer();
-        this._predictor = new Predictor(options.id || 'local', modeldir, options.nprocesses);
+        this._predictor = new Predictor(modeldir, options);
 
         this._exactmatcher = exactmatcher;
         this._tpClient = tpClient;
@@ -103,6 +105,7 @@ export default class LocalParserClient {
             return;
         const builder = new ExactMatcherBuilder({
             locale: this._locale,
+            timezone: this._platform.timezone,
             cachedir: this._platform.getCacheDir(),
             developerdir: Array.isArray(developerDir) ? developerDir : [developerDir],
             thingpediaClient: this._tpClient,
@@ -177,6 +180,11 @@ export default class LocalParserClient {
 
         let result : PredictionCandidate[]|null = null;
         let exact : string[][]|null = null;
+        const intent = {
+            command: 1,
+            other: 0,
+            ignore: 0
+        };
 
         if (tokens.length === 0) {
             result = [{
@@ -204,27 +212,37 @@ export default class LocalParserClient {
         }
 
         if (result === null) {
-            if (options.expect === 'Location') {
-                result = [{
-                    code: ['$answer', '(', 'new', 'Location', '(', '"', ...tokens, '"', ')', ')', ';'],
-                    score: 1
-                }];
-            } else {
-                if (contextCode)
-                    contextCode = this._applyPreHeuristics(contextCode);
+            if (contextCode)
+                contextCode = this._applyPreHeuristics(contextCode);
 
-                let candidates;
-                if (contextCode)
-                    candidates = await this._predictor.predict(contextCode.join(' '), tokens.join(' '), answer, NLU_TASK, options.example_id);
-                else
-                    candidates = await this._predictor.predict(tokens.join(' '), undefined, answer, SEMANTIC_PARSING_TASK, options.example_id);
-                result = candidates.map((c) => {
-                    return {
-                        code: c.answer.split(' '),
-                        score: c.score
-                    };
-               });
-            }
+            let candidates;
+            if (contextCode)
+                candidates = await this._predictor.predict(contextCode.join(' '), tokens.join(' '), answer, NLU_TASK, options.example_id);
+            else
+                candidates = await this._predictor.predict(tokens.join(' '), undefined, answer, SEMANTIC_PARSING_TASK, options.example_id);
+            assert(candidates.length > 0);
+
+            result = candidates.map((c) => {
+                // convert is_correct and is_probably_correct scores into
+                // a single scale such that >0.5 is correct and >0.25 is
+                // probably correct
+                const score = (c.score.is_correct ?? 1) >= 0.5 ? 1 :
+                    (c.score.is_probably_correct ?? 1) >= 0.5 ? 0.35 : 0.15;
+                return {
+                    code: c.answer.split(' '),
+                    score: score
+                };
+            });
+
+            if (candidates[0].score.is_junk >= 0.5)
+                intent.ignore = 1;
+            else
+                intent.ignore = 0;
+            if (intent.ignore < 0.5 && candidates[0].score.is_ood >= 0.5)
+                intent.other = 1;
+            else
+                intent.other = 0;
+            intent.command = 1 - intent.ignore - intent.other;
         }
 
         let result2 = result!; // guaranteed not null
@@ -246,7 +264,8 @@ export default class LocalParserClient {
                     return {
                         code: ThingTalkUtils.serializePrediction(parsed, tokens, entities, {
                             locale: this._locale,
-                            compatibility: options.thingtalk_version
+                            compatibility: options.thingtalk_version,
+                            ignoreSentence: true
                         }),
                         score: c.score
                     };
@@ -260,18 +279,18 @@ export default class LocalParserClient {
             result: 'ok',
             tokens: tokens,
             candidates: result2,
-            entities: entities
+            entities: entities,
+            intent
         };
     }
 
     async generateUtterance(contextCode : string[], contextEntities : EntityMap, targetAct : string[]) : Promise<GenerationResult[]> {
-        let candidates = await this._predictor.predict(contextCode.join(' ') + ' ' + targetAct.join(' '), NLG_QUESTION, undefined, NLG_TASK);
-        candidates = candidates.map((cand) => {
+        const candidates = await this._predictor.predict(contextCode.join(' ') + ' ' + targetAct.join(' '), NLG_QUESTION, undefined, NLG_TASK);
+        return candidates.map((cand) => {
             return {
-                answer: this._langPack.postprocessNLG(cand.answer, contextEntities),
-                score: cand.score
+                answer: cand.answer,
+                score: cand.score.confidence ?? 1
             };
         });
-        return candidates;
     }
 }

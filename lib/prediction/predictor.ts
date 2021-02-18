@@ -18,69 +18,54 @@
 //
 // Author: Giovanni Campagna <gcampagn@cs.stanford.edu>
 
-
 import assert from 'assert';
 import * as events from 'events';
 import * as child_process from 'child_process';
+import * as Tp from 'thingpedia';
 
 import JsonDatagramSocket from '../utils/json_datagram_socket';
 
 const DEFAULT_QUESTION = 'translate from english to thingtalk';
 
-interface PredictionCandidate {
+export interface RawPredictionCandidate {
     answer : string;
-    score : number;
+    score : Record<string, number>;
 }
 
 interface Request {
-    resolve(data : PredictionCandidate[][]) : void;
+    resolve(data : RawPredictionCandidate[][]) : void;
     reject(err : Error) : void;
 }
 
-const MINIBATCH_SIZE = 30;
-const MAX_LATENCY = 50; // milliseconds
+const DEFAULT_MINIBATCH_SIZE = 30;
+const DEFAULT_MAX_LATENCY = 50; // milliseconds
+
 interface Example {
     context : string;
     question : string;
     answer ?: string;
     example_id ?: string;
 
-    resolve(data : PredictionCandidate[]) : void;
+    resolve(data : RawPredictionCandidate[]) : void;
     reject(err : Error) : void;
 }
 
-class Worker extends events.EventEmitter {
-    id : string;
+class LocalWorker extends events.EventEmitter {
     private _child : child_process.ChildProcess|null;
-    private _hadError : boolean;
     private _stream : JsonDatagramSocket|null;
     private _nextId : 0;
     private _requests : Map<number, Request>;
     private _modeldir : string;
 
-    private _minibatchTask = '';
-    private _minibatch : Example[] = [];
-    private _minibatchStartTime = 0;
-
-    constructor(id : string, modeldir : string) {
+    constructor(modeldir : string) {
         super();
 
-        this.id = id;
         this._child = null;
-        this._hadError = false;
         this._stream = null;
         this._nextId = 0;
         this._requests = new Map;
 
         this._modeldir = modeldir;
-    }
-
-    get ok() : boolean {
-        return this._child !== null && !this._hadError;
-    }
-
-    get busy() : boolean {
-        return this._requests.size > 0;
     }
 
     stop() {
@@ -97,30 +82,29 @@ class Worker extends events.EventEmitter {
         ];
         if (process.env.GENIENLP_EMBEDDINGS)
             args.push('--embeddings', process.env.GENIENLP_EMBEDDINGS);
-        if (process.env.GENIENLP_DATABASE)
-            args.push('--database', process.env.GENIENLP_DATABASE);
+        if (process.env.GENIENLP_DATABASE_DIR)
+            args.push('--database_dir', process.env.GENIENLP_DATABASE_DIR);
 
         this._child = child_process.spawn('genienlp', args, {
             stdio: ['pipe', 'pipe', 'inherit']
         });
         this._child.on('error', (e) => {
             this._failAll(e);
-            this._hadError = true;
             this.emit('error', e);
         });
         this._child.on('exit', (code, signal) => {
             //console.error(`Child exited with code ${code}, signal ${signal}`);
 
-            this._failAll(new Error(`Worker died`));
+            const err = new Error(`Worker died`);
+            this._failAll(err);
+            this.emit('error', err);
             this._child = null;
             this.emit('exit');
         });
 
         this._stream = new JsonDatagramSocket(this._child.stdout!, this._child.stdin!, 'utf8');
-
         this._stream.on('error', (e) => {
             this._failAll(e);
-            this._hadError = true;
             this.emit('error', e);
         });
         this._stream.on('data', (msg) => {
@@ -130,39 +114,102 @@ class Worker extends events.EventEmitter {
             if (msg.error) {
                 req.reject(new Error(msg.error));
             } else {
-                req.resolve(msg.instances.map((instance : any) : PredictionCandidate[] => {
+                req.resolve(msg.instances.map((instance : any) : RawPredictionCandidate[] => {
                     if (instance.candidates) {
                         return instance.candidates;
                     } else {
-                        // no beam search, hence only one candidate, and fixed score
+                        // no beam search, hence only one candidate
+                        // the score might present or not, depending on whether
+                        // we calibrate or not
                         return [{
                             answer: instance.answer,
-                            score: 1
+                            score: instance.score || {}
                         }];
                     }
                 }));
             }
             this._requests.delete(msg.id);
-
-            if (this._minibatch.length > 0 && this._requests.size === 0)
-                this._flushRequest();
         });
     }
 
     private _failAll(error : Error) {
         for (const { reject } of this._requests.values())
             reject(error);
-        for (const ex of this._minibatch)
-            ex.reject(error);
-        this._minibatch = [];
-        this._minibatchTask = '';
-        this._minibatchStartTime = 0;
         this._requests.clear();
     }
 
-    private _flushRequest() {
+    request(task : string, minibatch : Example[]) : Promise<RawPredictionCandidate[][]> {
         const id = this._nextId ++;
 
+        return new Promise((resolve, reject) => {
+            this._requests.set(id, { resolve, reject });
+            //console.error(`${this._requests.size} pending requests`);
+
+            this._stream!.write({ id, task, instances: minibatch }, (err : Error | undefined | null) => {
+                if (err) {
+                    console.error(err);
+                    reject(err);
+                }
+            });
+        });
+    }
+}
+
+class RemoteWorker extends events.EventEmitter {
+    private _url : string;
+
+    constructor(url : string) {
+        super();
+        this._url = url;
+    }
+
+    start() {}
+    stop() {}
+
+    async request(task : string, minibatch : Example[]) : Promise<RawPredictionCandidate[][]> {
+        const response = await Tp.Helpers.Http.post(this._url, JSON.stringify({
+            task,
+            instances: minibatch
+        }), { dataContentType: 'application/json', accept: 'application/json' });
+        return JSON.parse(response).predictions.map((instance : any) : RawPredictionCandidate[] => {
+            if (instance.candidates) {
+                return instance.candidates;
+            } else {
+                // no beam search, hence only one candidate
+                // the score might present or not, depending on whether
+                // we calibrate or not
+                return [{
+                    answer: instance.answer,
+                    score: instance.score || {}
+                }];
+            }
+        });
+    }
+}
+
+export default class Predictor {
+    private _modelurl : string;
+    private _worker : LocalWorker|RemoteWorker|null;
+    private _stopped : boolean;
+
+    private _minibatchSize : number;
+    private _maxLatency : number;
+
+    private _minibatchTask = '';
+    private _minibatch : Example[] = [];
+    private _minibatchStartTime = 0;
+
+    constructor(modelurl : string, { minibatchSize = DEFAULT_MINIBATCH_SIZE, maxLatency = DEFAULT_MAX_LATENCY }) {
+        this._modelurl = modelurl;
+        this._worker = null;
+
+        this._minibatchSize = minibatchSize;
+        this._maxLatency = maxLatency;
+
+        this._stopped = false;
+    }
+
+    private _flushRequest() {
         const minibatch = this._minibatch;
         const task = this._minibatchTask;
         this._minibatch = [];
@@ -171,28 +218,14 @@ class Worker extends events.EventEmitter {
 
         //console.error(`minibatch: ${minibatch.length} instances`);
 
-        const request = {
-            resolve(candidates : PredictionCandidate[][]) {
-                assert(candidates.length === minibatch.length);
-                for (let i = 0; i < minibatch.length; i++)
-                    minibatch[i].resolve(candidates[i]);
-            },
-            reject(err : Error) {
-                for (let i = 0; i < minibatch.length; i++)
-                    minibatch[i].reject(err);
-            }
-        };
-        this._requests.set(id, request);
-        //console.error(`${this._requests.size} pending requests`);
-
-        this._stream!.write({ id, task, instances: minibatch.map((ex) => {
-            return {
-                context: ex.context,
-                question: ex.question,
-                answer: ex.answer,
-                example_id: ex.example_id
-            };
-        }) });
+        this._worker!.request(task, minibatch).then((candidates) => {
+            assert(candidates.length === minibatch.length);
+            for (let i = 0; i < minibatch.length; i++)
+                minibatch[i].resolve(candidates[i]);
+        }, (err : Error) => {
+            for (let i = 0; i < minibatch.length; i++)
+                minibatch[i].reject(err);
+        });
     }
 
     private _startRequest(ex : Example, task : string, now : number) {
@@ -202,9 +235,9 @@ class Worker extends events.EventEmitter {
         this._minibatchStartTime = now;
 
         setTimeout(() => {
-            if (this._minibatch.length > 0 && this._requests.size === 0)
+            if (this._minibatch.length > 0)
                 this._flushRequest();
-        }, MAX_LATENCY);
+        }, this._maxLatency);
     }
 
     private _addRequest(ex : Example, task : string) {
@@ -212,8 +245,8 @@ class Worker extends events.EventEmitter {
         if (this._minibatch.length === 0) {
             this._startRequest(ex, task, now);
         } else if (this._minibatchTask === task &&
-            ((now - this._minibatchStartTime < MAX_LATENCY) || this._requests.size > 0) &&
-            this._minibatch.length < MINIBATCH_SIZE) {
+            (now - this._minibatchStartTime < this._maxLatency) &&
+            this._minibatch.length < this._minibatchSize) {
             this._minibatch.push(ex);
         } else {
             this._flushRequest();
@@ -221,13 +254,17 @@ class Worker extends events.EventEmitter {
         }
     }
 
-    request(task : string, context : string, question : string, answer ?: string, example_id ?: string) : Promise<PredictionCandidate[]> {
+    predict(context : string, question = DEFAULT_QUESTION, answer ?: string, task = 'almond', example_id ?: string) : Promise<RawPredictionCandidate[]> {
         assert(typeof context === 'string');
         assert(typeof question === 'string');
 
-        let resolve ! : (data : PredictionCandidate[]) => void,
+        // ensure we have a worker, in case it recently died
+        if (!this._worker)
+            this.start();
+
+        let resolve ! : (data : RawPredictionCandidate[]) => void,
             reject ! : (err : Error) => void;
-        const promise = new Promise<PredictionCandidate[]>((_resolve, _reject) => {
+        const promise = new Promise<RawPredictionCandidate[]>((_resolve, _reject) => {
             resolve = _resolve;
             reject = _reject;
         });
@@ -235,94 +272,47 @@ class Worker extends events.EventEmitter {
 
         return promise;
     }
-}
-
-export default class Predictor {
-    id : string;
-    private _nWorkers : number;
-    private _modeldir : string;
-    private _nextId : number;
-    private _workers : Set<Worker>;
-    private _stopped : boolean;
-
-    constructor(id : string, modeldir : string, nWorkers = 1) {
-        this._nWorkers = nWorkers;
-
-        this.id = id;
-        this._modeldir = modeldir;
-        this._nextId = 0;
-        this._workers = new Set;
-
-        this._stopped = false;
-    }
 
     start() {
-        //console.log(`Spawning ${this._nWorkers} workers for predictor ${this.id}`);
-        for (let i = 0; i < this._nWorkers; i++)
-            this._startWorker();
+        let worker : RemoteWorker|LocalWorker;
+        if (/^kf\+https?:/.test(this._modelurl)) {
+            worker = new RemoteWorker(this._modelurl.substring('kf+'.length));
+        } else {
+            assert(this._modelurl.startsWith('file://'));
+            worker = new LocalWorker(this._modelurl.substring('file://'.length));
+        }
+
+        worker.on('error', (error : Error) => {
+            if (!this._stopped)
+                console.error(`Prediction worker had an error: ${error.message}`);
+            this._worker = null;
+
+            // fail all the requests in the minibatch if the worker is hosed
+            for (const ex of this._minibatch)
+                ex.reject(error);
+            this._minibatch = [];
+            this._minibatchStartTime = 0;
+            this._minibatchTask = '';
+
+            worker.stop();
+        });
+        worker.start();
+
+        this._worker = worker;
     }
 
     stop() {
         this._stopped = true;
-        this._killall();
-    }
-
-    private _killall() {
-        for (const worker of this._workers)
-            worker.stop();
+        if (this._worker)
+            this._worker.stop();
     }
 
     reload() {
-        // stop all workers and clear them up
-        this._killall();
-        this._workers.clear();
+        // stop the worker, if any
+        if (this._worker)
+            this._worker.stop();
 
         // start again
         this.start();
-    }
-
-    private _startWorker() {
-        const worker = new Worker(`${this.id}/${this._nextId++}`, this._modeldir);
-        worker.on('error', (err) => {
-            console.error(`Worker ${worker.id} had an error: ${err.message}`);
-            worker.stop();
-        });
-        worker.on('exit', (err) => {
-            if (!this._stopped)
-                console.error(`Worker ${worker.id} exited`);
-            this._workers.delete(worker);
-
-            if (!this._stopped) {
-                // wait 30 seconds, then autorespawn the worker
-                // this ensures that we don't stay with fewer workers than
-                // we should for too long, as that can overload the few workers
-                // who are alive, and cause latency issues
-                setTimeout(() => {
-                    if (this._workers.size < this._nWorkers)
-                        this._startWorker();
-                }, 30000);
-            }
-        });
-
-        worker.start();
-        this._workers.add(worker);
-        return worker;
-    }
-
-    predict(context : string, question = DEFAULT_QUESTION, answer ?: string, task = 'almond', example_id ?: string) {
-        // first pick a worker that is free
-        for (const worker of this._workers) {
-            if (worker.ok && !worker.busy)
-                return worker.request(task, context, question, answer, example_id);
-        }
-
-        // failing that, pick any worker that is alive
-        for (const worker of this._workers) {
-            if (worker.ok)
-                return worker.request(task, context, question, answer, example_id);
-        }
-
-        // failing that, spawn a new worker
-        return this._startWorker().request(task, context, question, answer, example_id);
     }
 }

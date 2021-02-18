@@ -2,7 +2,7 @@
 //
 // This file is part of Genie
 //
-// Copyright 2019-2020 The Board of Trustees of the Leland Stanford Junior University
+// Copyright 2019-2021 The Board of Trustees of the Leland Stanford Junior University
 //           2019 National Taiwan University
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,8 +22,103 @@
 
 import assert from 'assert';
 import { Ast, Type } from 'thingtalk';
-import type { I18n } from 'genie-toolkit';
-import type { ThingpediaLoader } from './load-thingpedia';
+
+import type { SlotBag } from './slot_bag';
+
+import type ThingpediaLoader from './load-thingpedia';
+
+// slot objects to track filters, input and output parameters
+// these objects are similar to the Ast node they wrap
+// but they also add the function name, so we don't mix parameters
+// across functions with the same name
+
+/**
+ * A placeholder of the form "something", "some person", etc.
+ */
+export interface Placeholder {
+    type : Type;
+}
+
+/**
+ * A phrase that includes a coreference, such as "post this on twitter",
+ * "post the caption on twitter", "book it on yelp", "book the restaurant on yelp"
+ */
+export interface ExpressionWithCoreference {
+    // the actual expression
+    // for "post this", "book it" and "book the restaurant", it will be something like:
+    // ```
+    // @com.twitter.post(status=p_status);
+    // ```
+    // (i.e., `p_status` is still present from the primitive template
+    // and can be replaced with other things)
+    //
+    // for "post the caption", it will be something like:
+    // ```
+    // @com.twitter.post(status=caption);
+    // ```
+    // i.e. `p_status` has been replaced already and no further replacement
+    // is necessary
+    //
+    // note that this allows "book the restaurant" to be matched with a query
+    // that is not `@com.yelp.restaurant()`, as long as the type matches
+    // whereas "post the caption" must be matched with the query where the
+    // word "caption" comes from, not just any query that uses the parameter
+    // `caption`
+    expression : Ast.Expression;
+
+    // the type of the parameter where the coreference is used
+    type : Type;
+
+    // the parameter that was used to make the coreference, if any
+    // this is null for "post this" and "book the restaurant",
+    // and not null for "post the caption"
+    slot : ParamSlot|null;
+
+    // the parameter that needs to be replaced with the coreference
+    // this is not-null for "post this" and "book the restaurant",
+    // and null for "post the caption"
+    pname : string|null;
+}
+
+export interface ErrorMessage {
+    code : string;
+    bag : SlotBag;
+}
+
+export interface ParamSlot {
+    schema : Ast.FunctionDef;
+    name : string;
+    type : Type;
+    filterable : boolean;
+    ast : Ast.VarRefValue;
+}
+
+// used by filters of the form "the number of <compound param> that have <filter> in <table>"
+export interface FilterValueSlot {
+    schema : Ast.FunctionDef;
+    name : string;
+    ast : Ast.FilterValue;
+}
+
+export interface FilterSlot {
+    schema : Ast.FunctionDef;
+    ptype : Type;
+    ast : Ast.BooleanExpression;
+}
+
+// a filter not tied to a specific function
+// this is used for certain domain-independent templates like "nearby"
+export interface DomainIndependentFilterSlot {
+    schema : null;
+    ptype : Type|null;
+    ast : Ast.BooleanExpression;
+}
+
+export interface InputParamSlot {
+    schema : Ast.FunctionDef;
+    ptype : Type;
+    ast : Ast.InputParam;
+}
 
 function typeToStringSafe(type : Type) : string {
     if (type instanceof Type.Array)
@@ -38,87 +133,114 @@ function typeToStringSafe(type : Type) : string {
         return String(type);
 }
 
-function clean(name : string) : string {
-    if (/^[vwgp]_/.test(name))
-        name = name.substr(2);
-    return name.replace(/_/g, ' ').replace(/([^A-Z ])([A-Z])/g, '$1 $2').toLowerCase();
+export function makeInputParamSlot(slot : ParamSlot,
+                                   value : Ast.Value,
+                                   tpLoader : ThingpediaLoader) : InputParamSlot|null {
+    const vtype = value.getType();
+    const ptype = slot.type;
+
+    if (!Type.isAssignable(ptype, vtype, {}, tpLoader.entitySubTypeMap))
+        return null;
+
+    return { schema: slot.schema, ptype : slot.type,
+        ast: new Ast.InputParam(null, slot.name, value) };
 }
 
-function makeFilter(loader : ThingpediaLoader,
-                    pname : Ast.Value,
+export function makeDomainIndependentFilter(pname : string,
+                                            op : string,
+                                            value : Ast.Value) : DomainIndependentFilterSlot {
+    return { schema: null, ptype: value.getType(),
+        ast: new Ast.AtomBooleanExpression(null, pname, op, value, null) };
+}
+
+function makeFilter(tpLoader : ThingpediaLoader,
+                    slot : ParamSlot,
                     op : string,
                     value : Ast.Value,
-                    negate ?: false) : Ast.AtomBooleanExpression|null;
-function makeFilter(loader : ThingpediaLoader,
-                    pname : Ast.Value,
-                    op : string,
-                    value : Ast.Value,
-                    negate : true) : Ast.NotBooleanExpression|null;
-function makeFilter(loader : ThingpediaLoader,
-                    pname : Ast.Value,
-                    op : string,
-                    value : Ast.Value,
-                    negate : boolean) : Ast.AtomBooleanExpression|Ast.NotBooleanExpression|null;
-function makeFilter(loader : ThingpediaLoader,
-                    pname : Ast.Value,
-                    op : string,
-                    value : Ast.Value,
-                    negate = false) : Ast.BooleanExpression|null {
-    assert(pname instanceof Ast.Value.VarRef);
+                    negate = false) : FilterSlot|null {
     const vtype = value.getType();
-    let ptype = vtype;
+    const ptype = slot.type;
+    // XXX url filters?
     if (ptype instanceof Type.Entity && ptype.type === 'tt:url')
         return null;
+
     if (op === 'contains') {
-        if (loader.params.out.has(pname.name + '+' + Type.RecurrentTimeSpecification) && (vtype.isTime || vtype.isDate))
-            ptype = Type.RecurrentTimeSpecification;
-        else
-            ptype = new Type.Array(vtype);
+        if (ptype === Type.RecurrentTimeSpecification) {
+            if (!(vtype.isTime || vtype.isDate))
+                return null;
+        } else {
+            if (!(ptype instanceof Type.Array))
+                return null;
+
+            const elem = ptype.elem as Type;
+            if ((vtype.isEnum && elem.isEnum) || (vtype.isEntity && elem.isEntity)) {
+                if (!Type.isAssignable(vtype, elem, tpLoader.entitySubTypeMap))
+                    return null;
+            } else if (!elem.equals(vtype)) {
+                return null;
+            }
+        }
         if (vtype.isString)
             op = 'contains~';
-    } else if (op === '==' && vtype.isString) {
-        op = '=~';
-    }
-    if (!loader.params.out.has(pname.name + '+' + ptype) && pname.name !== 'id')
-        return null;
+    } else if (op === 'in_array') {
+        if (vtype.equals(new Type.Array(Type.String)) && ptype.isEntity)
+            op = 'in_array~';
+        else if (!vtype.equals(new Type.Array(ptype)))
+            return null;
+    } else {
+        // note: we need to use "isAssignable" instead of "equals" here
+        // to handle enums and entities correctly
+        if ((vtype.isEnum && ptype.isEnum) || (vtype.isEntity && ptype.isEntity)) {
+            if (!Type.isAssignable(vtype, ptype, tpLoader.entitySubTypeMap))
+                return null;
+        } else if (!ptype.equals(vtype)) {
+            return null;
+        }
 
-    const f = new Ast.BooleanExpression.Atom(null, pname.name, op, value);
+        if (op === '==' && vtype.isString)
+            op = '=~';
+    }
+
+    let ast = new Ast.BooleanExpression.Atom(null, slot.name, op, value);
     if (negate)
-        return new Ast.BooleanExpression.Not(null, f);
-    else
-        return f;
+        ast = new Ast.BooleanExpression.Not(null, ast);
+    return { schema: slot.schema, ptype, ast };
 }
 
-function makeAndFilter(loader : ThingpediaLoader,
-                       param : Ast.Value,
+function makeAndFilter(tpLoader : ThingpediaLoader,
+                       slot : ParamSlot,
                        op : string,
-                       values : Ast.Value[],
-                       negate=false) : Ast.BooleanExpression|null {
+                       values : [Ast.Value, Ast.Value],
+                       negate = false) : FilterSlot|null {
     if (values.length !== 2)
         return null;
     if (values[0].equals(values[1]))
         return null;
-    const operands  = values.map((v) => makeFilter(loader, param, op, v));
-    if (operands.includes(null))
+    const operands = [
+        makeFilter(tpLoader, slot, op, values[0]),
+        makeFilter(tpLoader, slot, op, values[1])
+    ];
+    if (operands[0] === null || operands[1] === null)
         return null;
-    const f = new Ast.BooleanExpression.And(null, operands);
+    let ast = new Ast.BooleanExpression.And(null, [operands[0].ast, operands[1].ast]);
     if (negate)
-        return new Ast.BooleanExpression.Not(null, f);
-    return f;
+        ast = new Ast.BooleanExpression.Not(null, ast);
+    return { schema: slot.schema, ptype: slot.type, ast };
 }
 
-function makeDateRangeFilter(loader : ThingpediaLoader,
-                             param : Ast.Value,
-                             values : Ast.Value[]) : Ast.BooleanExpression|null {
+function makeDateRangeFilter(tpLoader : ThingpediaLoader,
+                             slot : ParamSlot,
+                             values : Ast.Value[]) : FilterSlot|null {
     if (values.length !== 2)
         return null;
     const operands = [
-        makeFilter(loader, param, '>=', values[0]),
-        makeFilter(loader, param, '<=', values[1])
-    ];
-    if (operands.includes(null))
+        makeFilter(tpLoader, slot, '>=', values[0]),
+        makeFilter(tpLoader, slot, '<=', values[1])
+    ] as const;
+    if (operands[0] === null || operands[1] === null)
         return null;
-    return new Ast.BooleanExpression.And(null, operands);
+    const ast = new Ast.BooleanExpression.And(null, [operands[0].ast, operands[1].ast]);
+    return { schema: slot.schema, ptype: slot.type, ast };
 }
 
 function isHumanEntity(type : Type|string) : boolean {
@@ -167,176 +289,16 @@ function interrogativePronoun(type : Type) : 'who'|'where'|'when'|'what' {
     return 'what';
 }
 
-const PARAM_REGEX = /\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})/;
-
-function* split(pattern : string, regexp : RegExp|string) : Generator<string|string[], void> {
-    // a split that preserves capturing parenthesis
-
-    const clone = new RegExp(regexp, 'g');
-    let match = clone.exec(pattern);
-
-    let i = 0;
-    while (match !== null) {
-        if (match.index > i)
-            yield pattern.substring(i, match.index);
-        yield match;
-        i = clone.lastIndex;
-        match = clone.exec(pattern);
-    }
-    if (i < pattern.length)
-        yield pattern.substring(i, pattern.length);
-}
-
-function splitParams(utterance : string) : Array<string|string[]> {
-    return Array.from(split(utterance, PARAM_REGEX));
-}
-
-function tokenizeExample(tokenizer : I18n.BaseTokenizer,
-                         utterance : string,
-                         id : number) : string {
-    let replaced = '';
-    const params : Array<[string, string]> = [];
-
-    for (const chunk of splitParams(utterance.trim())) {
-        if (chunk === '')
-            continue;
-        if (typeof chunk === 'string') {
-            replaced += chunk;
-            continue;
-        }
-
-        const [match, param1, param2, opt] = chunk;
-        if (match === '$$') {
-            replaced += '$';
-            continue;
-        }
-        const param = param1 || param2;
-        replaced += ' ____ ';
-        params.push([param, opt]);
-    }
-
-    const tokenized = tokenizer.tokenize(replaced);
-    const tokens = tokenized.tokens;
-    const entities = tokenized.entities;
-
-    if (Object.keys(entities).length > 0)
-        throw new Error(`Error in Example ${id}: Cannot have entities in the utterance`);
-
-    let preprocessed = '';
-    let first = true;
-    for (let token of tokens) {
-        if (token === '____') {
-            const [param, opt] = params.shift()!;
-            if (opt)
-                token = '${' + param + ':' + opt + '}';
-            else
-                token = '${' + param + '}';
-        } else if (token === '$') {
-            token = '$$';
-        }
-        if (!first)
-            preprocessed += ' ';
-        preprocessed += token;
-        first = false;
-    }
-
-    return preprocessed;
-}
-
-function isSameFunction(fndef1 : Ast.ExpressionSignature,
-                        fndef2 : Ast.ExpressionSignature) : boolean {
-    if (!(fndef1 instanceof Ast.FunctionDef) ||
-        !(fndef2 instanceof Ast.FunctionDef)) // a join
-        return false;
-    if (!fndef1.class || !fndef2.class)
-        return false;
-    return fndef1.class.name === fndef2.class.name &&
-        fndef1.name === fndef2.name;
-}
-
-class HasUndefinedVisitor extends Ast.NodeVisitor {
-    hasUndefined = false;
-
-    visitInvocation(invocation : Ast.Invocation) {
-        const schema = invocation.schema;
-        assert(schema instanceof Ast.FunctionDef);
-        const requireEither = schema.getAnnotation<string[][]>('require_either');
-        if (requireEither) {
-            const params = new Set;
-            for (const in_param of invocation.in_params)
-                params.add(in_param.name);
-
-            for (const requirement of requireEither) {
-                let satisfied = false;
-                for (const option of requirement) {
-                    if (params.has(option)) {
-                        satisfied = true;
-                        break;
-                    }
-                }
-                if (!satisfied)
-                    this.hasUndefined = true;
-            }
-        }
-
+function isSameFunction(fndef1 : Ast.FunctionDef,
+                        fndef2 : Ast.FunctionDef) : boolean {
+    assert(fndef1);
+    assert(fndef2);
+    if (fndef1 === fndef2)
         return true;
-    }
-
-    visitValue(value : Ast.Value) {
-        if (value.isUndefined)
-            this.hasUndefined = true;
-        return true;
-    }
-}
-
-function isExecutable(stmt : Ast.Statement) : boolean {
-    const visitor = new HasUndefinedVisitor();
-    stmt.visit(visitor);
-    return !visitor.hasUndefined;
-}
-
-/**
- * Normalize the #[confirm] annotation.
- *
- * #[confirm] is a three-state enum annotation with values:
- * - #[confirm=enum(confirm)]: must confirm explicitly with all parameters before the
- *   function is called (using a statement with #[confirm=enum(confirmed)] annotation)
- * - #[confirm=enum(display_result)]: the result of any query that feeds into the parameters
- *   of this function should be displayed before the function is executed; this is encoded
- *   by splitting any compound statement into two statements, executed sequentially
- * - #[confirm=enum(auto)]: the function can be called without explicit confirmation, even
- *   if some of the parameters are coming from other functions; this is the only #[confirm]
- *   that allows the function to be called multiple times in a single statement
- *
- * For legacy/ease of development reasons, if unspecified #[confirm] defaults to "confirm"
- * for actions (full confirmation before executing side effects) and "display_result" for
- * queries (splitting table joins into two statements).
- *
- * Also, #[confirm] can be specified as a boolean: "true" means "confirm" and "false" means
- * "display_result".
- */
-function normalizeConfirmAnnotation(fndef : Ast.FunctionDef) : 'confirm' | 'display_result' | 'auto' {
-    const value = fndef.getAnnotation('confirm');
-    if (value === undefined) // unspecified
-        return fndef.functionType === 'action' ? 'confirm' : 'display_result';
-
-    if (typeof value === 'boolean')
-        return value ? 'confirm' : 'display_result';
-
-    assert(value === 'confirm' || value === 'display_result' || value === 'auto');
-    return value;
+    return fndef1.qualifiedName === fndef2.qualifiedName;
 }
 
 export {
-    clean,
-
-    split,
-    splitParams,
-    tokenizeExample,
-
-    isExecutable,
-    normalizeConfirmAnnotation,
-
     isSameFunction,
 
     typeToStringSafe,

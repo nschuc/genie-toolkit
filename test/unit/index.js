@@ -40,16 +40,21 @@ async function do_test(array) {
 
 // test lib scripts
 do_test([
+    ('./test_bart_canonical_extractor'),
     ('./test_array_set'),
     ('./test_augment'),
     ('./test_bart_canonical_extractor'),
     ('./test_base_canonical_generator'),
     ('./test_bert_canonical_generator'),
     ('./test_btrie'),
+    ('./test_describe'),
+    ('./test_describe_api'),
+    ('./test_describe_policy'),
     ('./test_engine_protocol'),
     ('./test_entities'),
     ('./test_entity_match'),
     ('./test_exact_matcher'),
+    ('./test_formatter'),
     ('./test_helpers'),
     ('./test_i18n_chinese'),
     ('./test_ip_address'),
@@ -68,4 +73,7 @@ do_test([
     ('./test_timers'),
     ('./test_trie'),
     //('./test_wikidata_utils'),
+    ('./test_wikidata_utils'),
+    ('./test_infix_to_postfix'),
+    ('./test_pos_nfa')
 ]);

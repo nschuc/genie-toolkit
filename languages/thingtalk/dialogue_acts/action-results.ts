@@ -21,7 +21,7 @@
 
 import assert from 'assert';
 
-import { Ast, Type } from 'thingtalk';
+import { Ast } from 'thingtalk';
 
 import * as C from '../ast_manip';
 
@@ -36,6 +36,14 @@ import {
 import {
     isInfoPhraseCompatibleWithResult
 } from './common';
+
+export type ActionSuccessPhraseWithResult = [Ast.Expression|null, SlotBag];
+
+export function actionSuccessPhraseWithResultKeyFn([expression, bag] : ActionSuccessPhraseWithResult) {
+    return {
+        functionName: bag.schema!.qualifiedName
+    };
+}
 
 function makeThingpediaActionSuccessPhrase(ctx : ContextInfo, info : SlotBag) {
     const results = ctx.results;
@@ -53,34 +61,50 @@ function makeThingpediaActionSuccessPhrase(ctx : ContextInfo, info : SlotBag) {
     return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_success', null), info);
 }
 
-function makeCompleteActionSuccessPhrase(ctx : ContextInfo, action : Ast.Invocation, info : SlotBag|null) {
+function makeCompleteActionSuccessPhrase(ctx : ContextInfo, action : Ast.Expression, info : SlotBag|null) {
     const results = ctx.results;
     assert(results);
 
-    // TODO: multiple action results at once:
-    // "I played Foo, Bar, and Baz for you."
-    if (results.length > 1)
-        return null;
-
     // check the action is the same we actually executed, and all the parameters we're mentioning
     // match the actual parameters of the action
-    assert(action instanceof Ast.Invocation);
+    let last;
+    if (action instanceof Ast.ChainExpression)
+        last = action.last;
+    else
+        last = action;
+    assert(last instanceof Ast.InvocationExpression);
     const ctxInvocation = C.getInvocation(ctx.current!);
     if (!C.isSameFunction(ctxInvocation.schema!, action.schema!))
         return null;
 
-    for (const newParam of action.in_params) {
+    for (const newParam of last.invocation.in_params) {
         if (newParam.value.isUndefined)
             continue;
 
-        let found = false;
+        let found = false, wasParamPassing = false;
         for (const oldParam of ctxInvocation.in_params) {
             assert(!oldParam.value.isUndefined); // we ran the action, so it cannot have $? params
 
             if (newParam.name === oldParam.name) {
-                // newParam is a constant, but oldParam might be a param passing
-                if (!oldParam.value.isVarRef && !newParam.value.equals(oldParam.value))
-                    return null;
+                if (newParam.value instanceof Ast.VarRefValue) {
+                    // we're using a join to describe this action
+                    // we don't need to check that the table is correct, because
+                    // the table comes from a context phrase, but do check the action
+                    // is correct
+                    if (oldParam.value instanceof Ast.VarRefValue) {
+                        wasParamPassing = true;
+                        if (newParam.value.name !== oldParam.value.name)
+                            return null;
+                    } else {
+                        return null;
+                    }
+                } else {
+                    // newParam is a constant, but oldParam might be a param passing
+                    if (oldParam.value instanceof Ast.VarRefValue)
+                        wasParamPassing = true;
+                    else if (!newParam.value.equals(oldParam.value))
+                        return null;
+                }
                 found = true;
                 break;
             }
@@ -95,17 +119,27 @@ function makeCompleteActionSuccessPhrase(ctx : ContextInfo, action : Ast.Invocat
             // against the result entry
         }
 
-        // check also the result entry, if we have one
-        // this checks that input parameters are correct, if they were parameter passed
-        // and checks that the output parameters are correct
-        if (results.length >= 1) {
-            const topResult = results[0];
-            const resultValue = topResult.value[newParam.name];
-            if (!resultValue)
+        if (!(newParam.value instanceof Ast.VarRefValue)) {
+            // if we can't check in the result bag, and we didn't find a constant
+            // to check against in the program, then this phrase is no good
+            // because we're hallucinating the value
+            if (results.length === 0 && (!found || wasParamPassing))
+                return null;
+            if (results.length > 1)
                 return null;
 
-            if (!resultValue.equals(newParam.value))
-                return null;
+            // if the parameter is a constant, check also the result entry, if we have one
+            // this checks that input parameters are correct, if they were parameter passed
+            // and checks that the output parameters are correct
+            if (results.length >= 1) {
+                const topResult = results[0];
+                const resultValue = topResult.value[newParam.name];
+                if (!resultValue)
+                    return null;
+
+                if (!resultValue.equals(newParam.value))
+                    return null;
+            }
         }
     }
 
@@ -113,8 +147,7 @@ function makeCompleteActionSuccessPhrase(ctx : ContextInfo, action : Ast.Invocat
         if (results.length < 1)
             return null;
         assert(info instanceof SlotBag);
-        const topResult = results[0];
-        if (!isInfoPhraseCompatibleWithResult(topResult, info))
+        if (!results.every((r) => isInfoPhraseCompatibleWithResult(r, info)))
             return null;
     }
 
@@ -131,7 +164,7 @@ export interface ErrorMessage {
 }
 
 function checkThingpediaErrorMessage(ctx : ContextInfo, msg : ErrorMessage) {
-    if (!C.isSameFunction(ctx.currentFunctionSchema!, msg.bag.schema!))
+    if (!C.isSameFunction(ctx.currentFunction!, msg.bag.schema!))
         return null;
     const error = ctx.error;
     if (!(error instanceof Ast.EnumValue) || error.value !== msg.code)
@@ -149,7 +182,7 @@ function checkThingpediaErrorMessage(ctx : ContextInfo, msg : ErrorMessage) {
 function checkActionErrorMessage(ctx : ContextInfo, action : Ast.Invocation) {
     // check the action is the same we actually executed, and all the parameters we're mentioning
     // match the actual parameters of the action
-    if (!C.isSameFunction(ctx.currentFunctionSchema!, action.schema!))
+    if (!C.isSameFunction(ctx.currentFunction!, action.schema!))
         return null;
     const ctxInvocation = C.getInvocation(ctx.current!);
     for (const newParam of action.in_params) {
@@ -172,10 +205,12 @@ function checkActionErrorMessage(ctx : ContextInfo, action : Ast.Invocation) {
     return ctx;
 }
 
-function makeActionErrorPhrase(ctx : ContextInfo, questions : string[]) {
-    const schema = ctx.currentFunctionSchema!;
+function makeActionErrorPhrase(ctx : ContextInfo, questions : C.ParamSlot[]) {
+    const schema = ctx.currentFunction!;
     for (const q of questions) {
-        const arg = schema.getArgument(q);
+        if (!C.isSameFunction(schema, q.schema))
+            return null;
+        const arg = schema.getArgument(q.name);
         if (!arg || !arg.is_input)
             return null;
     }
@@ -185,42 +220,51 @@ function makeActionErrorPhrase(ctx : ContextInfo, questions : string[]) {
         return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_error', null));
 
     if (questions.length === 1) {
-        const type = schema.getArgType(questions[0])!;
-        return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_error_question', questions), null, type);
+        const type = schema.getArgType(questions[0].name)!;
+        return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_error_question', questions.map((q) => q.name)), null, type);
     }
-    return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_error_question', questions));
+    return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_action_error_question', questions.map((q) => q.name)));
 }
 
-function actionErrorChangeParam(ctx : ContextInfo, answer : Ast.Value|Ast.InputParam) {
-    const schema = ctx.currentFunctionSchema!;
+function actionErrorChangeParam(ctx : ContextInfo, answer : Ast.Value|C.InputParamSlot) {
+    const schema = ctx.currentFunction!;
     const questions = ctx.state.dialogueActParam || [];
+    let ipslot : C.InputParamSlot;
     if (answer instanceof Ast.Value) {
         if (questions.length !== 1)
             return null;
-        answer = new Ast.InputParam(null, questions[0], answer);
+        const arg = schema.getArgument(questions[0]);
+        if (!arg || !arg.is_input || !arg.type.equals(answer.getType()))
+            return null;
+        ipslot = {
+            schema,
+            ptype: answer.getType(),
+            ast: new Ast.InputParam(null, questions[0], answer)
+        };
+    } else {
+        ipslot = answer;
+        if (!C.isSameFunction(ipslot.schema, schema))
+            return null;
     }
-    const arg = schema.getArgument(answer.name);
-    if (!arg || !arg.is_input || !arg.type.equals(answer.value.getType()))
-        return null;
 
     const action = C.getInvocation(ctx.current!);
     if (!action)
         return null;
     // shallow clone
-    const clone = new Ast.Invocation(null, action.selector, action.channel, action.in_params.slice(), action.schema);
-    setOrAddInvocationParam(clone, answer.name, answer.value);
+    const clone = action.clone();
+    setOrAddInvocationParam(clone, ipslot.ast.name, ipslot.ast.value);
     return replaceAction(ctx, 'execute', clone, 'accepted');
 }
 
-function actionSuccessQuestion(ctx : ContextInfo, questions : Array<[string, Type|null]>) {
-    for (const [qname, qtype] of questions) {
-        const arg = ctx.currentFunctionSchema!.getArgument(qname);
+function actionSuccessQuestion(ctx : ContextInfo, questions : C.ParamSlot[]) {
+    for (const q of questions) {
+        if (!C.isSameFunction(q.schema, ctx.currentFunction!))
+            return null;
+        const arg = ctx.currentFunction!.getArgument(q.name);
         if (!arg || arg.is_input)
             return null;
-        if (qtype !== null && !qtype.equals(arg.type))
-            return null;
     }
-    return makeSimpleState(ctx, 'action_question', questions.map(([qname, qtype]) => qname));
+    return makeSimpleState(ctx, 'action_question', questions.map((q) => q.name));
 }
 
 export {

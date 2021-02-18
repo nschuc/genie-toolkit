@@ -33,15 +33,25 @@ import type * as Genie from 'genie-toolkit';
 import type * as Tp from 'thingpedia';
 
 import {
-    clean,
+    ParamSlot,
+    ErrorMessage,
+    ExpressionWithCoreference,
     typeToStringSafe,
+    makeInputParamSlot,
     makeFilter,
     makeAndFilter,
     makeDateRangeFilter,
     isHumanEntity,
     interrogativePronoun,
-    tokenizeExample
 } from './utils';
+import {
+    replaceSlotBagPlaceholders,
+    replaceErrorMessagePlaceholders,
+    replacePlaceholdersWithConstants,
+    replacePlaceholderWithTableOrStream,
+    replacePlaceholderWithCoreference,
+} from './primitive_templates';
+import * as keyfns from './keyfns';
 import { SlotBag } from './slot_bag';
 
 function identity<T>(x : T) : T {
@@ -91,54 +101,64 @@ interface CanonicalForm {
     implicit_identity ?: boolean;
 }
 
-interface GrammarOptions {
-    thingpediaClient : Tp.BaseClient;
-    schemaRetriever ?: SchemaRetriever;
-    flags : { [key : string] : boolean };
-    debug : number;
-    onlyDevices ?: string[];
-    whiteList ?: string;
+// FIXME this info needs to be in Thingpedia
+interface ExtendedEntityRecord {
+    type : string;
+    name : string;
+    is_well_known : boolean|number;
+    has_ner_support : boolean|number;
+    subtype_of ?: string|null;
 }
 
-export class ThingpediaLoader {
-    private _runtime ! : typeof Genie.SentenceGeneratorRuntime;
-    private _grammar ! : Genie.SentenceGenerator<any, Ast.Input>;
-    private _schemas ! : SchemaRetriever;
-    private _tpClient ! : Tp.BaseClient;
-    private _langPack ! : Genie.I18n.LanguagePack;
-    private _options ! : GrammarOptions;
-    private _allTypes ! : Map<string, Type>;
-    private _idTypes ! : Set<string>;
-    private _entities ! : Record<string, { has_ner_support : boolean }>;
-    types ! : {
-        readonly all : Map<string, Type>;
-        readonly id : Set<string>;
-    };
-    params ! : {
-        readonly in : Map<string, [string, [string, string]]>;
-        readonly out : Map<string, [string, string]>;
-    };
-    projections ! : {
-        [pname : string] : {
-            [cat : string] : Array<[string, string, string]>;
-        };
-    };
-    idQueries ! : Map<string, Ast.FunctionDef>;
-    compoundArrays ! : { [key : string] : InstanceType<typeof Type.Compound> };
-    globalWhiteList ! : string[]|null;
-    standardSchemas ! : {
+type PrimitiveTemplateType = 'action'|'action_past'|'query'|'get_command'|'stream'|'program';
+
+export default class ThingpediaLoader {
+    private _runtime : typeof Genie.SentenceGeneratorRuntime;
+    private _ttUtils : typeof Genie.ThingTalkUtils;
+    private _grammar : Genie.SentenceGenerator<any, Ast.Input>;
+    private _schemas : SchemaRetriever;
+    private _tpClient : Tp.BaseClient;
+    private _langPack : Genie.I18n.LanguagePack;
+    private _options : Genie.SentenceGeneratorTypes.GrammarOptions;
+    private _describer : Genie.ThingTalkUtils.Describer;
+
+    private _entities : Record<string, ExtendedEntityRecord>
+    // cached annotations extracted from Thingpedia, for use at inference time
+    private _errorMessages : Map<string, Record<string, string[]>>;
+    private _resultStrings : Map<string, string[]>;
+
+    types : Map<string, Type>;
+    params : ParamSlot[];
+    projections : Array<{
+        pname : string;
+        pslot : ParamSlot;
+        category : string;
+        pronoun : string;
+        base : string;
+        canonical : string;
+    }>;
+    idQueries : Map<string, Ast.FunctionDef>;
+    compoundArrays : { [key : string] : InstanceType<typeof Type.Compound> };
+    globalWhiteList : string[]|null;
+    standardSchemas : {
         say : Ast.FunctionDef|null;
         get_gps : Ast.FunctionDef|null;
         get_time : Ast.FunctionDef|null;
     };
+    entitySubTypeMap : Record<string, string>;
+    private _subEntityMap : Map<string, string[]>;
 
-    async init(runtime : typeof Genie.SentenceGeneratorRuntime,
-               grammar : Genie.SentenceGenerator<any, Ast.Input>,
-               langPack : Genie.I18n.LanguagePack,
-               options : GrammarOptions) : Promise<void> {
+    constructor(runtime : typeof Genie.SentenceGeneratorRuntime,
+                ttUtils : typeof Genie.ThingTalkUtils,
+                grammar : Genie.SentenceGenerator<any, Ast.Input>,
+                langPack : Genie.I18n.LanguagePack,
+                options : Genie.SentenceGeneratorTypes.GrammarOptions) {
         this._runtime = runtime;
+        this._ttUtils = ttUtils;
         this._grammar = grammar;
         this._langPack = langPack;
+        this._describer = new ttUtils.Describer(langPack.locale,
+            options.timezone, options.entityAllocator, options.forSide);
 
         this._tpClient = options.thingpediaClient;
         if (!options.schemaRetriever) {
@@ -148,33 +168,26 @@ export class ThingpediaLoader {
         this._schemas = options.schemaRetriever!;
 
         this._options = options;
-
-        this._allTypes = new Map;
-        this._idTypes = new Set;
-        this._entities = {};
-        this.types = {
-            all: this._allTypes,
-            id: this._idTypes,
-        };
-        this.params = {
-            in: new Map,
-            out: new Map,
-        };
-        this.projections = {};
-        this.idQueries = new Map;
-        this.compoundArrays = {};
         if (this._options.whiteList)
             this.globalWhiteList = this._options.whiteList.split(',');
         else
             this.globalWhiteList = null;
 
-        const [say, get_gps, get_time] = await Promise.all([
-            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'action', 'say'),
-            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'query', 'get_gps'),
-            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'query', 'get_time')
-        ]);
-        this.standardSchemas = { say, get_gps, get_time };
+        this._entities = {};
+        this._errorMessages = new Map;
+        this._resultStrings = new Map;
+        this.types = new Map;
+        this.params = [];
+        this.projections = [];
+        this.idQueries = new Map;
+        this.compoundArrays = {};
+        this.entitySubTypeMap = {};
+        this._subEntityMap = new Map;
 
+        this.standardSchemas = { say: null, get_gps: null, get_time: null };
+    }
+
+    async init() {
         // make sure that these types are always available, regardless of which templates we have
         this._recordType(Type.String);
         this._recordType(Type.Date);
@@ -183,11 +196,47 @@ export class ThingpediaLoader {
         for (const unit of Units.BaseUnits)
             this._recordType(new Type.Measure(unit));
 
+        const [say, get_gps, get_time] = await Promise.all([
+            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'action', 'say'),
+            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'query', 'get_gps'),
+            this._tryGetStandard('org.thingpedia.builtin.thingengine.builtin', 'query', 'get_time')
+        ]);
+        this.standardSchemas = { say, get_gps, get_time };
+
         await this._loadMetadata();
+    }
+
+    get ttUtils() {
+        return this._ttUtils;
     }
 
     get flags() {
         return this._options.flags;
+    }
+
+    get describer() {
+        return this._describer;
+    }
+
+    isIDType(type : Type) {
+        if (!(type instanceof Type.Entity))
+            return false;
+        return this.idQueries.has(type.type);
+    }
+
+    getResultStrings(functionName : string) : string[] {
+        return this._resultStrings.get(functionName) || [];
+    }
+    getErrorMessages(functionName : string) : Record<string, string[]> {
+        return this._errorMessages.get(functionName) || {};
+    }
+
+    private _addRule<ArgTypes extends unknown[], ResultType>(nonTerm : string,
+                                                             parts : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal>,
+                                                             semanticAction : (...args : ArgTypes) => ResultType|null,
+                                                             keyFunction : (value : ResultType) => Genie.SentenceGeneratorTypes.DerivationKey,
+                                                             attributes : Genie.SentenceGeneratorTypes.RuleAttributes = {}) {
+        this._grammar.addRule(nonTerm, parts, semanticAction, keyFunction, attributes);
     }
 
     private async _tryGetStandard(kind : string,
@@ -209,58 +258,73 @@ export class ThingpediaLoader {
         if (type instanceof Type.Array)
             this._recordType(type.elem as Type);
         const typestr = typeToStringSafe(type);
-        if (this._allTypes.has(typestr))
+        if (this.types.has(typestr)) {
+            if (type.isArray)
+                return 'Any';
             return typestr;
-        this._allTypes.set(typestr, type);
+        }
+        this.types.set(typestr, type);
 
-        this._grammar.declareSymbol('out_param_' + typestr);
         if (type.isRecurrentTimeSpecification)
             return typestr;
+        if (type.isArray)
+            return 'Any';
 
-        this._grammar.declareSymbol('placeholder_' + typestr);
+        this._addRule<Ast.Value[], Ast.Value>('constant_or_undefined', [this._getConstantNT(type)],
+            identity, keyfns.valueKeyFn);
+
         if (!this._grammar.hasSymbol('constant_' + typestr)) {
-            if (!type.isEnum && !type.isEntity && !type.isArray)
+            if (!type.isEnum && !type.isEntity)
                 throw new Error('Missing definition for type ' + typestr);
             this._grammar.declareSymbol('constant_' + typestr);
-            this._grammar.addRule('constant_Any', [new this._runtime.NonTerminal('constant_' + typestr)],
-                this._runtime.simpleCombine(identity));
+            this._addRule<Ast.Value[], Ast.Value>('constant_Any', [this._getConstantNT(type)],
+                identity, keyfns.valueKeyFn);
 
             if (type instanceof Type.Enum) {
                 for (const entry of type.entries!) {
                     const value = new Ast.Value.Enum(entry);
                     value.getType = function() { return type; };
-                    this._grammar.addRule('constant_' + typestr, [clean(entry)],
-                        this._runtime.simpleCombine(() => value));
+                    this._addRule('constant_' + typestr, [this._ttUtils.clean(entry)],
+                        () => value, keyfns.valueKeyFn);
                 }
             }
         }
         return typestr;
     }
 
-    private _addOutParam(functionName : string,
-                         pname : string,
-                         type : Type,
-                         typestr : string,
-                         canonical : string) {
-        this._grammar.addRule('out_param_' + typestr, [canonical], this._runtime.simpleCombine(() => new Ast.Value.VarRef(pname)));
+    private _addOutParam(pslot : ParamSlot, canonical : string) {
+        this._addRule('out_param_Any', [canonical], () => pslot, keyfns.paramKeyFn);
 
-        if (type.isArray)
-            this._grammar.addRule('out_param_Array__Any', [canonical], this._runtime.simpleCombine(() => new Ast.Value.VarRef(pname)));
-
-        this._grammar.addRule('out_param_Any', [canonical], this._runtime.simpleCombine(() => new Ast.Value.VarRef(pname)));
+        if (pslot.type instanceof Type.Array) {
+            this._addRule('out_param_Array__Any', [canonical], () => pslot, keyfns.paramKeyFn);
+            const elem = pslot.type.elem as Type;
+            if (elem instanceof Type.Compound)
+                this._addRule('out_param_Array__Compound', [canonical], () => pslot, keyfns.paramKeyFn);
+        }
     }
 
-    private _recordInputParam(functionName : string, arg : Ast.ArgumentDef) {
+    private _getConstantNT(type : Type, { mustBeTrueConstant = false, strictTypeCheck = false } = {}) {
+        const typestr = this._recordType(type)!;
+
+        // mustBeTrueConstant indicates that we really need just a constant literal
+        // as oppposed to some relative constant like "today" or "here"
+        if (mustBeTrueConstant)
+            return new this._runtime.NonTerminal('constant_' + typestr, ['is_constant', true]);
+        else if (strictTypeCheck && typestr === 'Any')
+            return new this._runtime.NonTerminal('constant_' + typestr, ['type', type]);
+        else
+            return new this._runtime.NonTerminal('constant_' + typestr);
+    }
+
+    private _recordInputParam(schema : Ast.FunctionDef, arg : Ast.ArgumentDef) {
         const pname = arg.name;
         const ptype = arg.type;
-        const key = pname + '+' + ptype;
-        const typestr = this._recordType(ptype);
-        if (!typestr)
+        const ptypestr = this._recordType(ptype);
+        if (!ptypestr)
             return;
-        // FIXME match functionName
-        //if (this.params.out.has(key))
-        //    return;
-        this.params.out.set(key, [pname, typestr]);
+        const pslot : ParamSlot = { schema, name: pname, type: ptype,
+            filterable: false, ast: new Ast.Value.VarRef(pname) };
+        this.params.push(pslot);
 
         // compound types are handled by recursing into their fields through iterateArguments()
         // except FIXME that probably won't work? we need to create a record object...
@@ -276,14 +340,7 @@ export class ThingpediaLoader {
                 if (form.endsWith('?'))
                     form = form.substring(0, form.length-1).trim();
 
-                // HACK: we should record the function name always, not just at inference time
-                if (this._options.flags.inference) {
-                    this._grammar.addRule('thingpedia_slot_fill_question', [form], this._runtime.simpleCombine(() => {
-                        return { functionName, name: pname };
-                    }));
-                } else {
-                    this._grammar.addRule('thingpedia_slot_fill_question', [form], this._runtime.simpleCombine(() => pname));
-                }
+                this._addRule('thingpedia_slot_fill_question', [form], () => pslot, keyfns.paramKeyFn);
             }
         }
 
@@ -304,14 +361,14 @@ export class ThingpediaLoader {
         let canonical;
 
         if (!arg.metadata.canonical)
-            canonical = { base: [clean(pname)] };
+            canonical = { base: [this._ttUtils.clean(pname)] };
         else if (typeof arg.metadata.canonical === 'string')
             canonical = { base: [arg.metadata.canonical] };
         else
             canonical = arg.metadata.canonical;
 
         const corefconst = new this._runtime.NonTerminal('coref_constant');
-        const constant = new this._runtime.NonTerminal('constant_' + typestr);
+        const constant = this._getConstantNT(ptype);
         for (let cat in canonical) {
             if (cat === 'default')
                 continue;
@@ -330,7 +387,7 @@ export class ThingpediaLoader {
 
             if (cat === 'npv') {
                 // implicit identity does not make sense for input parameters
-                throw new TypeError(`Invalid annotation #_[canonical.implicit_identity=${annotvalue}] for ${functionName}`);
+                throw new TypeError(`Invalid annotation #_[canonical.implicit_identity=${annotvalue}] for ${schema.qualifiedName}`);
             }
 
             if (!Array.isArray(annotvalue))
@@ -344,7 +401,7 @@ export class ThingpediaLoader {
 
             for (const form of annotvalue) {
                 if (cat === 'base') {
-                    this._grammar.addRule('input_param', [form], this._runtime.simpleCombine(() => pname), attributes);
+                    this._addRule('input_param', [form], () => pslot, keyfns.paramKeyFn, attributes);
                 } else {
                     let [before, after] = form.split('#');
                     before = (before || '').trim();
@@ -364,8 +421,8 @@ export class ThingpediaLoader {
                         expansion = ['', constant, ''];
                         corefexpansion = ['', corefconst, ''];
                     }
-                    this._grammar.addRule(cat + '_input_param', expansion, this._runtime.simpleCombine((_1, value : Ast.Value, _2) => new Ast.InputParam(null, pname, value)), attributes);
-                    this._grammar.addRule('coref_' + cat + '_input_param', corefexpansion, this._runtime.simpleCombine((_1, value : Ast.Value, _2) => new Ast.InputParam(null, pname, value)), attributes);
+                    this._addRule(cat + '_input_param', expansion, (_1, value : Ast.Value, _2) => makeInputParamSlot(pslot, value, this), keyfns.inputParamKeyFn, attributes);
+                    this._addRule('coref_' + cat + '_input_param', corefexpansion, (_1, value : Ast.Value, _2) => makeInputParamSlot(pslot, value, this), keyfns.inputParamKeyFn, attributes);
                 }
 
                 if (this._options.flags.inference)
@@ -374,18 +431,16 @@ export class ThingpediaLoader {
         }
     }
 
-    private _recordBooleanOutputParam(functionName : string, arg : Ast.ArgumentDef) {
+    private _recordBooleanOutputParam(pslot : ParamSlot, arg : Ast.ArgumentDef) {
         const pname = arg.name;
         const ptype = arg.type;
-        const typestr = this._recordType(ptype);
-        if (!typestr)
+        if (!this._recordType(ptype))
             return;
-        const pvar = new Ast.Value.VarRef(pname);
 
         let canonical;
 
         if (!arg.metadata.canonical)
-            canonical = { base: [clean(pname)] };
+            canonical = { base: [this._ttUtils.clean(pname)] };
         else if (typeof arg.metadata.canonical === 'string')
             canonical = { base: [arg.metadata.canonical] };
         else
@@ -400,14 +455,14 @@ export class ThingpediaLoader {
                 annotvalue = [annotvalue];
             if (key === 'base') {
                 for (const form of annotvalue)
-                    this._addOutParam(functionName, pname, ptype, typestr, form.trim());
+                    this._addOutParam(pslot, form.trim());
 
                 continue;
             }
 
             const match = /^([a-zA-Z_]+)_(true|false)$/.exec(key);
             if (match === null) {
-                console.error(`Invalid canonical key ${key} for boolean output parameter ${functionName}:${arg.name}`);
+                console.error(`Invalid canonical key ${key} for boolean output parameter ${pslot.schema.qualifiedName}:${arg.name}`);
                 continue;
             }
             let cat = match[1];
@@ -424,8 +479,8 @@ export class ThingpediaLoader {
                 attributes.priority += 1;
 
             for (const form of annotvalue) {
-                this._grammar.addRule(cat + '_filter', [form], this._runtime.simpleCombine(() => makeFilter(this, pvar, '==', value, false)), attributes);
-                this._grammar.addRule(cat + '_boolean_projection', [form], this._runtime.simpleCombine(() => new Ast.Value.VarRef(pname)));
+                this._addRule(cat + '_filter', [form], () => makeFilter(this, pslot, '==', value, false), keyfns.filterKeyFn, attributes);
+                this._addRule(cat + '_boolean_projection', [form], () => pslot, keyfns.paramKeyFn);
 
                 if (this._options.flags.inference)
                     break;
@@ -434,19 +489,16 @@ export class ThingpediaLoader {
         }
     }
 
-    private _recordOutputParam(functionName : string, arg : Ast.ArgumentDef) {
+    private _recordOutputParam(schema : Ast.FunctionDef, arg : Ast.ArgumentDef) {
         const pname = arg.name;
         const ptype = arg.type;
-        const key = pname + '+' + ptype;
-        const typestr = this._recordType(ptype);
-        if (!typestr)
+        if (!this._recordType(ptype))
             return;
-        // FIXME match functionName
-        //if (this.params.out.has(key))
-        //    return;
-        this.params.out.set(key, [pname, typestr]);
 
-        const pvar = new Ast.Value.VarRef(pname);
+        const filterable = arg.getImplementationAnnotation<boolean>('filterable') ?? true;
+        const pslot : ParamSlot = { schema, name: pname, type: ptype,
+            filterable, ast: new Ast.Value.VarRef(pname) };
+        this.params.push(pslot);
 
         if (ptype.isCompound)
             return;
@@ -457,7 +509,7 @@ export class ThingpediaLoader {
                 prompt = [prompt];
 
             for (const form of prompt)
-                this._grammar.addRule('thingpedia_search_question', [form], this._runtime.simpleCombine(() => pvar));
+                this._addRule('thingpedia_search_question', [form], () => pslot, keyfns.paramKeyFn);
         }
         if (arg.metadata.question) {
             let question = arg.metadata.question;
@@ -465,11 +517,11 @@ export class ThingpediaLoader {
                 question = [question];
 
             for (const form of question)
-                this._grammar.addRule('thingpedia_user_question', [form], this._runtime.simpleCombine(() => [[pname, ptype]]));
+                this._addRule('thingpedia_user_question', [form], () => [pslot], keyfns.paramArrayKeyFn);
         }
 
         if (ptype.isBoolean) {
-            this._recordBooleanOutputParam(functionName, arg);
+            this._recordBooleanOutputParam(pslot, arg);
             return;
         }
 
@@ -477,7 +529,7 @@ export class ThingpediaLoader {
             this.compoundArrays[pname] = ptype.elem;
             for (const field in ptype.elem.fields) {
                 const arg = ptype.elem.fields[field];
-                this._recordOutputParam(functionName, arg);
+                this._recordOutputParam(schema, arg);
             }
         }
 
@@ -485,13 +537,13 @@ export class ThingpediaLoader {
             const forms = Array.isArray(arg.metadata.counted_object) ?
                 arg.metadata.counted_object : [arg.metadata.counted_object];
             for (const form of forms)
-                this._grammar.addRule('out_param_ArrayCount', [form], this._runtime.simpleCombine(() => pvar));
+                this._addRule('out_param_ArrayCount', [form], () => pslot, keyfns.paramKeyFn);
         }
 
         let canonical;
 
         if (!arg.metadata.canonical)
-            canonical = { base: [clean(pname)] };
+            canonical = { base: [this._ttUtils.clean(pname)] };
         else if (typeof arg.metadata.canonical === 'string')
             canonical = { base: [arg.metadata.canonical] };
         else if (Array.isArray(arg.metadata.canonical))
@@ -528,25 +580,22 @@ export class ThingpediaLoader {
             canUseBothForm = true;
 
         for (const type of vtypes)
-            this._recordOutputParamByType(functionName, pname, ptype, op, type, canonical, canUseBothForm);
+            this._recordOutputParamByType(pslot, op, type, canonical, canUseBothForm);
     }
 
-    private _recordOutputParamByType(functionName : string,
-                                     pname : string,
-                                     ptype : Type,
+    private _recordOutputParamByType(pslot : ParamSlot,
                                      op : string,
                                      vtype : Type,
                                      canonical : CanonicalForm,
                                      canUseBothForm : boolean) {
-        const pvar = new Ast.Value.VarRef(pname);
-        const typestr = this._recordType(ptype);
-        if (!typestr)
+        const ptype = pslot.type;
+        if (!this._recordType(ptype))
             return;
         const vtypestr = this._recordType(vtype);
-        if (vtypestr === null)
+        if (!vtypestr)
             return;
 
-        const constant = new this._runtime.NonTerminal('constant_' + vtypestr);
+        const constant = this._getConstantNT(vtype);
         const corefconst = new this._runtime.NonTerminal('coref_constant');
         for (let cat in canonical) {
             if (cat === 'default' || cat === 'projection_pronoun')
@@ -588,11 +637,11 @@ export class ThingpediaLoader {
 
             if (cat === 'npv') {
                 if (typeof annotvalue !== 'boolean')
-                    throw new TypeError(`Invalid annotation #_[canonical.implicit_identity=${annotvalue}] for ${functionName}`);
+                    throw new TypeError(`Invalid annotation #_[canonical.implicit_identity=${annotvalue}] for ${pslot.schema.qualifiedName}`);
                 if (annotvalue) {
                     const expansion = [constant];
-                    this._grammar.addRule(cat + '_filter', expansion, this._runtime.simpleCombine((value : Ast.Value) => makeFilter(this, pvar, op, value, false)), attributes);
-                    this._grammar.addRule('coref_' + cat + '_filter', [corefconst], this._runtime.simpleCombine((value : Ast.Value) => makeFilter(this, pvar, op, value, false)), attributes);
+                    this._addRule(cat + '_filter', expansion, (value : Ast.Value) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
+                    this._addRule('coref_' + cat + '_filter', [corefconst], (value : Ast.Value) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
                 }
                 continue;
             }
@@ -607,7 +656,7 @@ export class ThingpediaLoader {
                         formarray = forms;
                     const value = new Ast.Value.Enum(enumerand);
                     for (const form of formarray)
-                        this._grammar.addRule(cat + '_filter', [form], this._runtime.simpleCombine(() => makeFilter(this, pvar, op, value, false)), attributes);
+                        this._addRule(cat + '_filter', [form], () => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
                 }
             } else if (argMinMax) {
                 let annotarray : string[];
@@ -617,21 +666,17 @@ export class ThingpediaLoader {
                 } else {
                     annotarray = annotvalue;
                 }
+                // appease the typechecker, which does not carry type refinements across callbacks
+                const argMinMax2 : 'asc'|'desc' = argMinMax;
 
                 for (const form of annotarray) {
-                    this._grammar.addRule(cat + '_argminmax', [form], this._runtime.simpleCombine(() => [pvar, argMinMax]), attributes);
+                    this._addRule(cat + '_argminmax', [form], () : [ParamSlot, 'asc'|'desc'] => [pslot, argMinMax2], keyfns.argMinMaxKeyFn, attributes);
                     if (this._options.flags.inference)
                         break;
                 }
             } else if (isProjection) {
                 if (cat === 'base')
                     continue;
-
-                // FIXME: if two params with the same name have different interrogative pronouns, this approach is problematic...
-                if (!(pname in this.projections))
-                    this.projections[pname] = {};
-                if (!(cat in this.projections[pname]))
-                    this.projections[pname][cat] = [];
 
                 let annotarray : string[];
                 if (!Array.isArray(annotvalue)) {
@@ -647,8 +692,8 @@ export class ThingpediaLoader {
                         if (typeof canonical.base_projection === 'string')
                             canonical.base_projection = [canonical.base_projection];
                         for (const base of canonical.base_projection) {
-                            this._addProjections(pname, 'what', cat, base, form);
-                            this._addProjections(pname, 'which', cat, base, form);
+                            this._addProjections(pslot, 'what', cat, base, form);
+                            this._addProjections(pslot, 'which', cat, base, form);
                         }
                     }
 
@@ -658,7 +703,7 @@ export class ThingpediaLoader {
                         if (typeof canonical.projection_pronoun === 'string')
                             canonical.projection_pronoun = [canonical.projection_pronoun];
                         for (const pronoun of canonical.projection_pronoun)
-                            this._addProjections(pname, pronoun, cat, '', form);
+                            this._addProjections(pslot, pronoun, cat, '', form);
 
                     } else {
                         const pronounType = interrogativePronoun(ptype);
@@ -670,7 +715,7 @@ export class ThingpediaLoader {
                             };
                             assert(pronounType in pronouns);
                             for (const pronoun of pronouns[pronounType])
-                                this._addProjections(pname, pronoun, cat, '', form);
+                                this._addProjections(pslot, pronoun, cat, '', form);
                         }
                     }
 
@@ -689,19 +734,19 @@ export class ThingpediaLoader {
 
                 for (const form of annotarray) {
                     if (cat === 'base') {
-                        this._addOutParam(functionName, pname, ptype, typestr, form.trim());
-                        if (!canonical.npp && !canonical.property) {
+                        this._addOutParam(pslot, form.trim());
+                        if (!canonical.npp && !canonical.property && pslot.schema.is_list) {
                             const expansion = [form, constant];
-                            this._grammar.addRule('npp_filter', expansion, this._runtime.simpleCombine((_, value : Ast.Value) => makeFilter(this, pvar, op, value, false)));
+                            this._addRule('npp_filter', expansion, (_, value : Ast.Value) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn);
                             const corefexpansion = [form, corefconst];
-                            this._grammar.addRule('coref_npp_filter', corefexpansion, this._runtime.simpleCombine((_, value : Ast.Value) => makeFilter(this, pvar, op, value, false)), attributes);
+                            this._addRule('coref_npp_filter', corefexpansion, (_, value : Ast.Value) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
 
                             if (canUseBothForm) {
                                 const pairexpansion = [form, new this._runtime.NonTerminal('both_prefix'), new this._runtime.NonTerminal('constant_pairs')];
-                                this._grammar.addRule('npp_filter', pairexpansion, this._runtime.simpleCombine((_1, _2, values : Ast.Value[]) => makeAndFilter(this, pvar, op, values, false)), attributes);
+                                this._addRule('npp_filter', pairexpansion, (_1, _2, values : [Ast.Value, Ast.Value]) => makeAndFilter(this, pslot, op, values, false), keyfns.filterKeyFn, attributes);
                             }
                         }
-                    } else {
+                    } else if (pslot.schema.is_list) {
                         let [before, after] = form.split('#');
                         before = (before || '').trim();
                         after = (after || '').trim();
@@ -732,12 +777,12 @@ export class ThingpediaLoader {
                             pairexpansion = ['', new this._runtime.NonTerminal('both_prefix'), new this._runtime.NonTerminal('constant_pairs'), ''];
                             daterangeexpansion = ['', new this._runtime.NonTerminal('constant_date_range'), ''];
                         }
-                        this._grammar.addRule(cat + '_filter', expansion, this._runtime.simpleCombine((_1, value : Ast.Value, _2) => makeFilter(this, pvar, op, value, false)), attributes);
-                        this._grammar.addRule('coref_' + cat + '_filter', corefexpansion, this._runtime.simpleCombine((_1, value : Ast.Value, _2) => makeFilter(this, pvar, op, value, false)), attributes);
+                        this._addRule(cat + '_filter', expansion, (_1, value : Ast.Value, _2) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
+                        this._addRule('coref_' + cat + '_filter', corefexpansion, (_1, value : Ast.Value, _2) => makeFilter(this, pslot, op, value, false), keyfns.filterKeyFn, attributes);
                         if (canUseBothForm)
-                            this._grammar.addRule(cat + '_filter', pairexpansion, this._runtime.simpleCombine((_1, _2, values : Ast.Value[], _3) => makeAndFilter(this, pvar, op, values, false)), attributes);
+                            this._addRule(cat + '_filter', pairexpansion, (_1, _2, values : [Ast.Value, Ast.Value], _3) => makeAndFilter(this, pslot, op, values, false), keyfns.filterKeyFn, attributes);
                         if (ptype.isDate)
-                            this._grammar.addRule(cat + '_filter', daterangeexpansion, this._runtime.simpleCombine((_1, values : Ast.Value[], _2) => makeDateRangeFilter(this, pvar, values)), attributes);
+                            this._addRule(cat + '_filter', daterangeexpansion, (_1, values : [Ast.Value, Ast.Value], _2) => makeDateRangeFilter(this, pslot, values), keyfns.filterKeyFn, attributes);
                     }
 
                     if (this._options.flags.inference)
@@ -747,125 +792,121 @@ export class ThingpediaLoader {
         }
     }
 
-    private _addProjections(pname : string, pronoun : string, posCategory : string, base : string, canonical : string) {
+    private _addProjections(pslot : ParamSlot, pronoun : string, posCategory : string, base : string, canonical : string) {
         if (canonical.includes('|')) {
             const [verb, prep] = canonical.split('|').map((span) => span.trim());
-            this.projections[pname][posCategory].push([`${prep} ${pronoun}`, base, verb]);
+            this.projections.push({
+                pname: pslot.name,
+                pslot,
+                category: posCategory,
+                pronoun: `${prep} ${pronoun}`,
+                base,
+                canonical: verb
+            });
 
             // for when question, we can drop the prep entirely
-            if (pronoun === 'when' || pronoun === 'what time')
-                this.projections[pname][posCategory].push([pronoun, base, verb]);
+            if (pronoun === 'when' || pronoun === 'what time') {
+                this.projections.push({
+                    pname: pslot.name,
+                    pslot,
+                    category: posCategory,
+                    pronoun: pronoun,
+                    base,
+                    canonical: verb
+                });
+            }
         }
-        this.projections[pname][posCategory].push([pronoun, base, canonical.replace(/\|/g, ' ')]);
+        this.projections.push({
+            pname: pslot.name,
+            pslot,
+            category: posCategory,
+            pronoun,
+            base,
+            canonical: canonical.replace(/\|/g, ' ')
+        });
     }
 
     private async _loadTemplate(ex : Ast.Example) {
-        // return grammar rules added
-        const rules = [];
-
         try {
             await ex.typecheck(this._schemas, true);
         } catch(e) {
             if (!e.message.startsWith('Invalid kind '))
                 console.error(`Failed to load example ${ex.id}: ${e.message}`);
-            return [];
+            return;
         }
 
-        // ignore builtin actions:
-        // debug_log is not interesting, say is special and we handle differently, configure/discover are not
-        // composable
+        // ignore certain builtin actions:
+        // debug_log is not interesting, say is special and we handle differently
+        // faq_reply is not composable
         if (ex.value instanceof Ast.InvocationExpression && ex.value.invocation.selector.kind === 'org.thingpedia.builtin.thingengine.builtin') {
             if (this._options.flags.turking && ex.type === 'action')
-                return [];
+                return;
             if (!this._options.flags.configure_actions && (ex.value.invocation.channel === 'configure' || ex.value.invocation.channel === 'discover'))
-                return [];
-            if (ex.value.invocation.channel === 'say')
-                return [];
+                return;
+            if (ex.type === 'action' && ['say', 'debug_log', 'faq_reply'].includes(ex.value.invocation.channel))
+                return;
         }
         if (ex.value instanceof Ast.FunctionCallExpression) // timers
-            return [];
+            return;
         if (this._options.flags.nofilter && (ex.value instanceof Ast.FilterExpression ||
             (ex.value instanceof Ast.MonitorExpression && ex.value.expression instanceof Ast.FilterExpression)))
-            return [];
-
-        // ignore optional input parameters
-        // if you care about optional, write a lambda template
-        // that fills in the optionals
+            return;
 
         for (const pname in ex.args) {
             const ptype = ex.args[pname];
-
-            //console.log('pname', pname);
-            if (!(pname in ex.value.schema!.inReq)) {
-                // somewhat of a hack, we declare the argument for the value,
-                // because later we will muck with schema only
-                ex.value.schema = ex.value.schema!.addArguments([new Ast.ArgumentDef(
-                    null,
-                    Ast.ArgDirection.IN_REQ,
-                    pname,
-                    ptype,
-                    {
-                        nl: {
-                            canonical: clean(pname)
-                        },
-                        impl: {}
-                    }
-                )]);
-            }
-            const pcanonical = ex.value.schema!.getArgCanonical(pname)!;
-
-            this.params.in.set(pname + '+' + ptype, [pname, [typeToStringSafe(ptype), pcanonical]]);
             this._recordType(ptype);
         }
 
         if (ex.type === 'query') {
             if (Object.keys(ex.args).length === 0 && ex.value.schema!.hasArgument('id')) {
                 const type = ex.value.schema!.getArgument('id')!.type;
-                if (isHumanEntity(type)) {
-                    const grammarCat = 'thingpedia_who_question';
-                    this._grammar.addRule(grammarCat, [''], this._runtime.simpleCombine(() => ex.value));
-                }
+                if (isHumanEntity(type))
+                    this._addRule('thingpedia_who_question', [''], () => ex.value, keyfns.expressionKeyFn);
             }
         }
 
         if (!ex.preprocessed || ex.preprocessed.length === 0) {
             // preprocess here...
             const tokenizer = this._langPack.getTokenizer();
-            ex.preprocessed = ex.utterances.map((utterance : string) => tokenizeExample(tokenizer, utterance, ex.id));
+            ex.preprocessed = ex.utterances.map((utterance : string) => this._ttUtils.tokenizeExample(tokenizer, utterance, ex.id));
         }
 
         for (let preprocessed of ex.preprocessed) {
-            let grammarCat = 'thingpedia_' + ex.type;
+            let grammarCat : PrimitiveTemplateType = ex.type as 'stream'|'query'|'action'|'program';
 
-            if (grammarCat === 'thingpedia_query' && preprocessed[0] === ',') {
+            if (grammarCat === 'query' && preprocessed[0] === ',') {
                 preprocessed = preprocessed.substring(1).trim();
-                grammarCat = 'thingpedia_get_command';
+                grammarCat = 'get_command';
             }
 
             if (this._options.debug >= this._runtime.LogLevel.INFO && preprocessed[0].startsWith(','))
                 console.log(`WARNING: template ${ex.id} starts with , but is not a query`);
 
-            if (this._options.flags.for_agent)
+            if (this._options.forSide === 'agent')
                 preprocessed = this._langPack.toAgentSideUtterance(preprocessed);
 
-            const chunks = this._addPrimitiveTemplate(grammarCat, preprocessed, ex.value);
-            rules.push({ category: grammarCat, expansion: chunks, example: ex });
-
-            if (grammarCat === 'thingpedia_action') {
+            this._addPrimitiveTemplate(grammarCat, preprocessed, ex);
+            if (grammarCat === 'action') {
                 const pastform = this._langPack.toVerbPast(preprocessed);
                 if (pastform)
-                    this._addPrimitiveTemplate('thingpedia_action_past', pastform, ex.value);
+                    this._addPrimitiveTemplate('action_past', pastform, ex);
             }
 
             if (this._options.flags.inference)
                 break;
         }
-        return rules;
     }
 
-    private _addPrimitiveTemplate<T>(grammarCat : string, preprocessed : string, value : T) : Array<string|Genie.SentenceGeneratorRuntime.Placeholder> {
+    private _addPrimitiveTemplate(grammarCat : PrimitiveTemplateType,
+                                  preprocessed : string,
+                                  example : Ast.Example) {
         const chunks = preprocessed.trim().split(' ');
-        const expansion : Array<string|Genie.SentenceGeneratorRuntime.Placeholder> = [];
+
+        // compute the basic expansion, and compute the names used in the primitive
+        // template for each non-terminal
+        const expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal> = [];
+        const names : Array<string|null> = [];
+        const options : string[] = [];
 
         for (const chunk of chunks) {
             if (chunk === '')
@@ -874,14 +915,176 @@ export class ThingpediaLoader {
                 const [, param1, param2, opt] = /^\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})$/.exec(chunk)!;
                 const param = param1 || param2;
                 assert(param);
-                expansion.push(new this._runtime.Placeholder(param, opt));
+
+                const type = example.args[param];
+                if (!type)
+                    throw new Error(`Invalid placeholder \${param} in primitive template`);
+
+                // don't use placeholders for booleans or enums, as that rarely makes sense
+                const canUseUndefined = grammarCat !== 'action_past' && opt !== 'no-undefined' &&
+                    opt !== 'const' && !type.isEnum && !type.isBoolean;
+
+                const nonTerm = canUseUndefined ? new this._runtime.NonTerminal('constant_or_undefined', ['type', type])
+                    : this._getConstantNT(type, { strictTypeCheck: true });
+
+                expansion.push(nonTerm);
+                names.push(param);
+                options.push(opt || '');
             } else {
                 expansion.push(chunk);
+                names.push(null);
+                options.push('');
             }
         }
 
-        this._grammar.addRule(grammarCat, expansion, this._runtime.simpleCombine<[], T>(() => value));
-        return chunks;
+        // template #1: just constants and/or undefined
+        this._addConstantOrUndefinedPrimitiveTemplate(grammarCat, expansion, names, example);
+
+        // template #2: replace placeholders with whole queries or streams
+        // TODO: enable this for table joins with param passing
+        if (grammarCat === 'action' || (this._options.flags.dialogues && grammarCat === 'action_past'))
+            this._addPlaceholderReplacementJoinPrimitiveTemplate(grammarCat, expansion, names, options, example);
+
+        // template #3: coreferences
+        if (grammarCat !== 'action_past' && grammarCat !== 'program')
+            this._addCoreferencePrimitiveTemplate(grammarCat, expansion, names, options, example);
+    }
+
+    /**
+     * Convert a primitive template into a regular template that introduces a
+     * coreference.
+     */
+    private _addCoreferencePrimitiveTemplate(grammarCat : 'stream'|'action'|'query'|'get_command',
+                                             expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal>,
+                                             names : Array<string|null>,
+                                             options : string[],
+                                             example : Ast.Example) {
+        const exParams = Object.keys(example.args);
+
+        // generate one rule for each possible parameter
+        // in each rule, choose a different parameter to be replaced with a table
+        // and the rest is constant or undefined
+        for (const tableParam of exParams) {
+            const paramIdx = names.indexOf(tableParam);
+            assert(paramIdx >= 0);
+
+            const option = options[paramIdx];
+            if (option === 'const') // no coreference if parameter uses :const in the placeholder
+                continue;
+
+            for (const corefSource of ['same_sentence', 'context', 'list_context']) {
+                if (corefSource === 'same_sentence' && grammarCat === 'stream')
+                    continue;
+
+                for (const fromNonTermName of [corefSource + '_coref', 'the_base_table', 'the_out_param_Any']) {
+                    if (corefSource === 'list_context' && fromNonTermName !== corefSource + '_coref')
+                        continue;
+
+                    let fromNonTerm;
+                    if (fromNonTermName === 'out_param_Any')
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName, ['type', example.args[tableParam]]);
+                    else if (fromNonTermName === 'the_base_table')
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName, ['idType', example.args[tableParam]]);
+                    else
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName);
+
+                    const clone = expansion.slice();
+                    clone[paramIdx] = fromNonTerm;
+
+                    this._addRule<Array<Ast.Value|Ast.Expression|ParamSlot|string>, ExpressionWithCoreference>(grammarCat + '_coref_' + corefSource, clone,
+                        (...args) => replacePlaceholderWithCoreference(example, names, paramIdx, args),
+                        keyfns.expressionWithCoreferenceKeyFn);
+                }
+            }
+        }
+    }
+
+    /**
+     * Convert a primitive template into a regular template that performs
+     * a join with parameter passing by replacing exactly one placeholder
+     * with a whole query or stream, and replacing the other placeholders with constants
+     * or undefined.
+     */
+    private _addPlaceholderReplacementJoinPrimitiveTemplate(grammarCat : 'action'|'query'|'get_command'|'action_past',
+                                                            expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal>,
+                                                            names : Array<string|null>,
+                                                            options : string[],
+                                                            example : Ast.Example) {
+        const exParams = Object.keys(example.args);
+
+        const fromNonTermNames =
+            grammarCat === 'action_past' ? ['ctx_current_query'] :
+            ['with_filtered_table', 'with_arg_min_max_table', 'projection_Any', 'stream_projection_Any'];
+
+        // generate one rule for each possible parameter
+        // in each rule, choose a different parameter to be replaced with a table
+        // and the rest is constant or undefined
+        for (const tableParam of exParams) {
+            const paramIdx = names.indexOf(tableParam);
+            assert(paramIdx >= 0);
+
+            const option = options[paramIdx];
+            if (option === 'const') // no parameter passing if parameter uses :const in the placeholder
+                continue;
+
+            const intoType = example.args[tableParam];
+
+            for (const fromNonTermName of fromNonTermNames) {
+                if (grammarCat === 'query' && fromNonTermName === 'stream_projection_Any') // TODO
+                    continue;
+
+                // non-terminal constraints only support equality (because they are mapped
+                // to hashtable) so we expand all possible sub entity to replace into
+                // so we can still replace efficiently
+                const fromTypes : Type[] = [intoType];
+                if (fromNonTermName !== 'ctx_current_query') {
+                    if (intoType instanceof Type.Entity) {
+                        for (const subEntity of this._subEntityMap.get(intoType.type) || [])
+                            fromTypes.push(new Type.Entity(subEntity));
+                    }
+                }
+
+                for (const fromType of fromTypes) {
+                    let fromNonTerm;
+                    if (fromNonTermName === 'ctx_current_query')
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName);
+                    else if (fromNonTermName === 'projection_Any' || fromNonTermName === 'stream_projection_Any')
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName, ['projectionType', fromType]);
+                    else
+                        fromNonTerm = new this._runtime.NonTerminal(fromNonTermName, ['implicitParamPassingType', fromType]);
+
+                    const clone = expansion.slice();
+                    clone[paramIdx] = fromNonTerm;
+
+                    let intoNonTerm;
+                    if (grammarCat === 'action_past')
+                        intoNonTerm = 'thingpedia_complete_join_action_past';
+                    else if (grammarCat === 'query')
+                        intoNonTerm = 'table_join_replace_placeholder';
+                    else if (fromNonTermName === 'stream_projection_Any')
+                        intoNonTerm = 'action_replace_param_with_stream';
+                    else
+                        intoNonTerm = 'action_replace_param_with_table';
+
+                    this._addRule<Array<Ast.Value|Ast.Expression>, Ast.ChainExpression>(intoNonTerm, clone,
+                        (...args) => replacePlaceholderWithTableOrStream(example, names, paramIdx, args, this),
+                        keyfns.expressionKeyFn);
+                }
+            }
+        }
+    }
+
+    /**
+     * Convert a primitive template into a regular template that uses
+     * only constants and undefined.
+     */
+    private _addConstantOrUndefinedPrimitiveTemplate(grammarCat : PrimitiveTemplateType,
+                                                     expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal>,
+                                                     names : Array<string|null>,
+                                                     example : Ast.Example) {
+        this._addRule<Ast.Value[], Ast.Expression>('thingpedia_complete_' + grammarCat, expansion,
+            (...args) => replacePlaceholdersWithConstants(example, names, args),
+            keyfns.expressionKeyFn);
     }
 
     private async _makeExampleFromQuery(q : Ast.FunctionDef) {
@@ -890,7 +1093,7 @@ export class ThingpediaLoader {
 
         const canonical : string[] = q.canonical ?
             (Array.isArray(q.canonical) ? q.canonical : [q.canonical]) :
-            [clean(q.name)];
+            [this._ttUtils.clean(q.name)];
 
         for (const form of canonical) {
             const pluralized = this._langPack.pluralize(form);
@@ -898,22 +1101,21 @@ export class ThingpediaLoader {
                 canonical.push(pluralized);
         }
 
-        const functionName = q.class!.name + ':' + q.name;
         const table = new Ast.InvocationExpression(null, invocation, q);
 
         let shortCanonical = q.metadata.canonical_short || canonical;
         if (!Array.isArray(shortCanonical))
             shortCanonical = [shortCanonical];
         for (const form of shortCanonical) {
-            this._grammar.addRule('base_table', [form], this._runtime.simpleCombine(() => table));
-            this._grammar.addRule('base_noun_phrase', [form], this._runtime.simpleCombine(() => functionName));
+            this._addRule('base_table', [form], () => table, keyfns.expressionKeyFn);
+            this._addRule('base_noun_phrase', [form], () => q, keyfns.functionDefKeyFn);
         }
 
         // FIXME English words should not be here
         for (const form of ['anything', 'one', 'something'])
-            this._grammar.addRule('generic_anything_noun_phrase', [form], this._runtime.simpleCombine(() => table));
+            this._addRule('generic_anything_noun_phrase', [form], () => table, keyfns.expressionKeyFn);
         for (const form of ['option', 'choice'])
-            this._grammar.addRule('generic_base_noun_phrase', [form], this._runtime.simpleCombine(() => table));
+            this._addRule('generic_base_noun_phrase', [form], () => table, keyfns.expressionKeyFn);
 
         await this._loadTemplate(new Ast.Example(
             null,
@@ -942,25 +1144,40 @@ export class ThingpediaLoader {
         const schemaClone = table.schema!.clone();
         schemaClone.is_list = false;
         schemaClone.no_filter = true;
-        this._grammar.addConstants('constant_name', 'GENERIC_ENTITY_' + idType.type, idType);
+        this._grammar.addConstants('constant_name', 'GENERIC_ENTITY_' + idType.type, idType,
+            keyfns.entityOrNumberValueKeyFn);
 
-        const idfilter = new Ast.BooleanExpression.Atom(null, 'id', '==', new Ast.Value.VarRef('p_id'));
+        let hasParentEntity = false;
+        if (entity.subtype_of) {
+            const parentFnDef = this.idQueries.get(entity.subtype_of);
+            if (parentFnDef)
+                hasParentEntity = true;
+        }
+
+        let span;
+        if (idType.type === q.class!.name + ':' + q.name && !hasParentEntity) {
+            // we make an example with just the name if and only if
+            // - this is the main query of this entity
+            // - this entity has no parent entity
+            span = [`\${p_name:no-undefined}`, ...canonical.map((c) => `${c} \${p_name:no-undefined}`)];
+        } else {
+            // make examples by name using the canonical form of the table
+            // to make the dataset unambiguous
+            span = canonical.map((c) => `${c} \${p_name:no-undefined}`);
+        }
+
+        const idfilter = new Ast.BooleanExpression.Atom(null, 'id', '==', new Ast.Value.VarRef('p_name'));
         await this._loadTemplate(new Ast.Example(
             null,
             -1,
             'query',
-            { p_id: id.type },
+            { p_name: id.type },
             new Ast.FilterExpression(null, table, idfilter, schemaClone),
-            [`\${p_id:no-undefined}`],
-            [`\${p_id:no-undefined}`],
+            span,
+            span,
             {}
         ));
         const namefilter = new Ast.BooleanExpression.Atom(null, 'id', '=~', new Ast.Value.VarRef('p_name'));
-        let span;
-        if (q.name === 'Person')
-            span = [`\${p_name:no-undefined}`, ...canonical.map((c) => `\${p_name:no-undefined} ${c}`)];
-        else
-            span = [`\${p_name:no-undefined}`, ...canonical.map((c) => `\${p_name:no-undefined} ${c}`), ...canonical.map((c) => `${c} \${p_name:no-undefined}`)];
         await this._loadTemplate(new Ast.Example(
             null,
             -1,
@@ -972,8 +1189,17 @@ export class ThingpediaLoader {
             {}
         ));
 
-        for (const arg of q.iterateArguments()) {
-            if (typeof arg.metadata.canonical === 'string' || Array.isArray(arg.metadata.canonical))
+        // we only apply reverse_property/implicit_identity to the function's
+        // _own_ arguments
+        //
+        // that way, we don't have confusion with the superfunction
+        // FIXME this probably doesn't work with whitelist
+        for (const argname of q.args) {
+            const arg = q.getArgument(argname)!;
+
+            if (typeof arg.metadata.canonical === 'string' ||
+                typeof arg.metadata.canonical === 'undefined' ||
+                Array.isArray(arg.metadata.canonical))
                 continue;
 
             let op = '==';
@@ -1039,29 +1265,30 @@ export class ThingpediaLoader {
         }
     }
 
-    private async _loadFunction(functionDef : Ast.FunctionDef) {
+    private async _recordFunction(functionDef : Ast.FunctionDef) {
         if (this.globalWhiteList && !this.globalWhiteList.includes(functionDef.name))
             return;
 
-        const functionName = functionDef.class!.kind + ':' + functionDef.name;
         for (const arg of functionDef.iterateArguments()) {
             if (arg.is_input)
-                this._recordInputParam(functionName, arg);
+                this._recordInputParam(functionDef, arg);
             else
-                this._recordOutputParam(functionName, arg);
+                this._recordOutputParam(functionDef, arg);
         }
 
         if (functionDef.functionType === 'query') {
             if (functionDef.is_list && functionDef.hasArgument('id')) {
                 const idarg = functionDef.getArgument('id')!;
-                if (idarg.type instanceof Type.Entity && idarg.type.type === functionName) {
-                    this.idQueries.set(functionName, functionDef);
-                    this._idTypes.add(typeToStringSafe(idarg.type));
-                }
+                const functionEntityType = functionDef.class!.kind + ':' + functionDef.name;
+                if (idarg.type instanceof Type.Entity && idarg.type.type === functionEntityType)
+                    this.idQueries.set(functionEntityType, functionDef);
             }
-
-            await this._makeExampleFromQuery(functionDef);
         }
+    }
+
+    private async _loadFunction(functionDef : Ast.FunctionDef) {
+        if (functionDef.functionType === 'query')
+            await this._makeExampleFromQuery(functionDef);
 
         if (functionDef.metadata.result)
             await this._loadCustomResultString(functionDef);
@@ -1070,56 +1297,122 @@ export class ThingpediaLoader {
     }
 
     private async _loadCustomErrorMessages(functionDef : Ast.FunctionDef) {
+        const bag = new SlotBag(functionDef);
+
+        const normalized : Record<string, string[]> = {};
+        this._errorMessages.set(functionDef.qualifiedName, normalized);
         for (const code in functionDef.metadata.on_error) {
             let messages = functionDef.metadata.on_error[code];
             if (!Array.isArray(messages))
                 messages = [messages];
+            normalized[code] = messages;
 
-            for (const msg of messages) {
-                const bag = new SlotBag(functionDef);
-
+            for (let i = 0; i < messages.length; i++) {
+                const msg = messages[i];
                 const chunks = msg.trim().split(' ');
+                const expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal> = [];
+                const names : Array<string|null> = [];
+
                 for (const chunk of chunks) {
                     if (chunk === '')
                         continue;
                     if (chunk.startsWith('$') && chunk !== '$$') {
                         const [, param1, param2,] = /^\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})$/.exec(chunk)!;
-                        const pname = param1 || param2;
-                        assert(pname);
-                        const ptype = functionDef.getArgType(pname)!;
-                        const pcanonical = functionDef.getArgCanonical(pname)!;
-                        this.params.in.set(pname + '+' + ptype, [pname, [typeToStringSafe(ptype), pcanonical]]);
-                        this._recordType(ptype);
+                        const param = param1 || param2;
+                        assert(param);
+                        // TODO use opt
+
+                        const arg = functionDef.getArgument(param);
+                        if (!arg)
+                            throw new Error(`Invalid placeholder \${param} in #_[on_error] annotation for @${functionDef.qualifiedName}`);
+
+                        assert(this._recordType(arg.type));
+                        expansion.push(this._getConstantNT(arg.type, { mustBeTrueConstant: true }));
+                        names.push(param);
+                    } else {
+                        expansion.push(chunk);
+                        names.push(null);
                     }
                 }
 
-                this._addPrimitiveTemplate('thingpedia_error_message', msg, { code, bag });
+                // give a small priority boost to each phrase, depending on the order
+                // in which they are given
+                const attributes = { priority: (messages.length-i) * 0.1 };
+                this._addRule<Ast.Value[], ErrorMessage>('thingpedia_error_message', expansion, (...args) => replaceErrorMessagePlaceholders({ code, bag }, names, args), keyfns.errorMessageKeyFn, attributes);
             }
         }
     }
 
     private async _loadCustomResultString(functionDef : Ast.FunctionDef) {
+        const bag = new SlotBag(functionDef);
+
         let resultstring = functionDef.metadata.result;
         if (!Array.isArray(resultstring))
             resultstring = [resultstring];
 
-        for (const form of resultstring)
-            this._addPrimitiveTemplate('thingpedia_result', form, new SlotBag(functionDef));
+        this._resultStrings.set(functionDef.qualifiedName, resultstring);
+        for (let i = 0; i < resultstring.length; i++) {
+            const form = resultstring[i];
+
+            const chunks = form.trim().split(' ');
+            const expansion : Array<string|Genie.SentenceGeneratorRuntime.NonTerminal> = [];
+            const names : Array<string|null> = [];
+
+            for (const chunk of chunks) {
+                if (chunk === '')
+                    continue;
+                if (chunk.startsWith('$') && chunk !== '$$') {
+                    const [, param1, param2,] = /^\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})$/.exec(chunk)!;
+                    const param = param1 || param2;
+                    assert(param);
+                    // TODO use opt
+
+                    const arg = functionDef.getArgument(param);
+                    if (!arg)
+                        throw new Error(`Invalid placeholder \${param} in #_[result] annotation for @${functionDef.qualifiedName}`);
+
+                    assert(this._recordType(arg.type));
+                    expansion.push(this._getConstantNT(arg.type, { mustBeTrueConstant: true }));
+                    names.push(param);
+                } else {
+                    expansion.push(chunk);
+                    names.push(null);
+                }
+            }
+
+            // give a small priority boost to each phrase, depending on the order
+            // in which they are given
+            const attributes = { priority: (resultstring.length-i) * 0.1 };
+            this._addRule<Ast.Value[], SlotBag>('thingpedia_result', expansion, (...args) => replaceSlotBagPlaceholders(bag, names, args),
+                keyfns.slotBagKeyFn, attributes);
+        }
     }
 
     private async _loadDevice(kind : string) {
         const classDef = await this._schemas.getFullMeta(kind);
 
         if (classDef.metadata.canonical) {
-            this._grammar.addRule('constant_Entity__tt__device', [classDef.metadata.canonical],
-                this._runtime.simpleCombine(() => new Ast.Value.Entity(kind, 'tt:device', null)));
+            this._addRule('constant_Entity__tt__device', [classDef.metadata.canonical],
+                () => new Ast.Value.Entity(kind, 'tt:device', null), keyfns.valueKeyFn);
         }
 
         for (const entity of classDef.entities) {
             let hasNer = entity.getImplementationAnnotation<boolean>('has_ner');
             if (hasNer === undefined)
                 hasNer = true;
-            this._loadEntityType(classDef.kind + ':' + entity.name, hasNer);
+            let subTypeOf = null;
+            if (entity.extends) {
+                subTypeOf = entity.extends.includes(':') ? entity.extends
+                    : classDef.kind + ':' + entity.extends;
+            }
+            const entityRecord : ExtendedEntityRecord = {
+                type: classDef.kind + ':' + entity.name,
+                name: entity.getImplementationAnnotation<string>('description')||'',
+                has_ner_support: hasNer,
+                is_well_known: false,
+                subtype_of: subTypeOf
+            };
+            this._loadEntityType(entityRecord.type, entityRecord);
         }
 
         const whitelist = classDef.getImplementationAnnotation<string[]>('whitelist');
@@ -1130,22 +1423,38 @@ export class ThingpediaLoader {
             actions = actions.filter((name) => whitelist.includes(name));
         }
 
+        // do one pass over all functions to learn about idQueries first
+        await Promise.all(queries.map((name) => classDef.queries[name]).map(this._recordFunction.bind(this)));
+        await Promise.all(actions.map((name) => classDef.actions[name]).map(this._recordFunction.bind(this)));
+
+        // do another pass to add primitive templates for each canonical form
         await Promise.all(queries.map((name) => classDef.queries[name]).map(this._loadFunction.bind(this)));
         await Promise.all(actions.map((name) => classDef.actions[name]).map(this._loadFunction.bind(this)));
     }
 
-    private _loadEntityType(entityType : string, hasNerSupport : boolean) {
-        this._entities[entityType] = { has_ner_support: hasNerSupport };
+    private _loadEntityType(entityType : string, typeRecord : ExtendedEntityRecord) {
+        this._entities[entityType] = typeRecord;
+        if (typeRecord.subtype_of) {
+            this.entitySubTypeMap[entityType] = typeRecord.subtype_of;
+
+            // TODO this only supports a flat hierarchy
+            // if we have a deeper hierarchy this code will not code
+            const subEntities = this._subEntityMap.get(typeRecord.subtype_of);
+            if (subEntities)
+                subEntities.push(typeRecord.type);
+            else
+                this._subEntityMap.set(typeRecord.subtype_of, [typeRecord.type]);
+        }
     }
 
     private _addEntityConstants() {
         for (const entityType in this._entities) {
             const ttType = new Type.Entity(entityType);
-            const typestr = typeToStringSafe(ttType);
             const { has_ner_support } = this._entities[entityType];
+            const typestr = this._recordType(ttType);
 
             if (has_ner_support) {
-                if (this._idTypes.has(typestr)) {
+                if (this.idQueries.has(entityType)) {
                     if (this._options.debug >= this._runtime.LogLevel.DUMP_TEMPLATES)
                         console.log('Loaded entity ' + entityType + ' as id entity');
                 } else {
@@ -1153,8 +1462,8 @@ export class ThingpediaLoader {
                         console.log('Loaded entity ' + entityType + ' as generic entity');
                 }
 
-                this._grammar.declareSymbol('constant_' + typestr);
-                this._grammar.addConstants('constant_' + typestr, 'GENERIC_ENTITY_' + entityType, ttType);
+                this._grammar.addConstants('constant_' + typestr, 'GENERIC_ENTITY_' + entityType, ttType,
+                    keyfns.entityOrNumberValueKeyFn);
             } else {
                 if (this._options.debug >= this._runtime.LogLevel.DUMP_TEMPLATES)
                     console.log('Loaded entity ' + entityType + ' as non-constant entity');
@@ -1181,12 +1490,8 @@ export class ThingpediaLoader {
         return devices.map((d) => d.kind);
     }
 
-    private async _getDataset(kind : string) {
-        return this._tpClient.getExamplesByKinds([kind]);
-    }
-
     private async _loadMetadata() {
-        const entityTypes = await this._tpClient.getAllEntityTypes();
+        const entityTypes : ExtendedEntityRecord[] = await this._tpClient.getAllEntityTypes();
 
         let devices;
         if (this._options.onlyDevices)
@@ -1204,21 +1509,10 @@ export class ThingpediaLoader {
         let datasets;
         if (this._options.onlyDevices) {
             datasets = await Promise.all(devices.map(async (d) => {
-                let parsed;
-                const dataset = await this._getDataset(d);
-                try {
-                    parsed = Syntax.parse(dataset);
-                } catch(e) {
-                    if (e.name !== 'SyntaxError')
-                        throw e;
-                    // try parsing using legacy syntax too in case we're talking
-                    // to an old Thingpedia that has not been migrated
-                    parsed = Syntax.parse(dataset, Syntax.SyntaxType.Legacy);
-                }
-                assert(parsed instanceof Ast.Library);
-                return parsed.datasets[0];
+                const dataset = await this._schemas.getExamplesByKind(d);
+                this._describer.setDataset(d, dataset);
+                return dataset;
             }));
-            datasets = datasets.filter((d) => !!d);
         } else {
             const code = await this._tpClient.getAllExamples();
             let parsed;
@@ -1233,6 +1527,7 @@ export class ThingpediaLoader {
             }
             assert(parsed instanceof Ast.Library);
             datasets = parsed.datasets;
+            this._describer.setFullDataset(datasets);
         }
 
         if (this._options.debug >= this._runtime.LogLevel.INFO) {
@@ -1241,8 +1536,10 @@ export class ThingpediaLoader {
             console.log('Loaded ' + countTemplates + ' templates');
         }
 
-        for (const entity of entityTypes)
-            this._loadEntityType(entity.type, !!(entity.type.startsWith('tt:') && entity.has_ner_support));
+        for (const entity of entityTypes) {
+            entity.has_ner_support = !!(entity.type.startsWith('tt:') && entity.has_ner_support);
+            this._loadEntityType(entity.type, entity);
+        }
         for (const device of devices)
             await this._loadDevice(device);
         this._addEntityConstants();
@@ -1250,5 +1547,3 @@ export class ThingpediaLoader {
             await this._loadDataset(dataset);
     }
 }
-
-export default new ThingpediaLoader();

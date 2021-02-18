@@ -20,23 +20,53 @@
 
 import assert from 'assert';
 import * as Tp from 'thingpedia';
-import * as ThingTalk from 'thingtalk';
 import { Ast, Type } from 'thingtalk';
 
 import type Engine from '../engine';
 import type { DeviceInfo } from '../engine';
 
+import { cleanKind } from '../utils/misc-utils';
 import ValueCategory from './value-category';
 import StatementExecutor from './statement_executor';
 import { CancellationError } from './errors';
-import * as Helpers from './helpers';
-import type DialogueLoop from './dialogue-loop';
 import { EntityRecord } from './entity-linking/entity-finder';
 import { Contact } from './entity-linking/contact_search';
+import { PlatformData } from './user-input';
 
 import AbstractDialogueAgent, {
     DisambiguationHints,
 } from './abstract_dialogue_agent';
+
+/**
+ * The interface that the {@link ExecutionDialogueAgent} uses to communicate
+ * with outside.
+ *
+ * In some code paths, {@link ExecutionDialogueAgent} needs to send messages
+ * to the user or ask questions, in the middle of preparing for execution
+ * and outside of the normal dialogue loop.
+ *
+ * It does so by calling this interface, which for the normal assistant is
+ * implemented by {@link DialogueLoop}.
+ *
+ * TODO: This interface has some ugly inversion of control where the outside
+ * code that drives the dialogue gets called synchronously by this code.
+ * We should refactor all of this.
+ */
+export interface AbstractDialogueLoop {
+    icon : string|null;
+    platformData : PlatformData;
+    isAnonymous : boolean;
+    _ : (x : string) => string;
+
+    reply(msg : string) : Promise<void>;
+    replyLink(title : string, link : string) : Promise<void>;
+    interpolate(msg : string, args : Record<string, unknown>) : string;
+    replyInterp(msg : string, args : Record<string, unknown>) : Promise<void>;
+    ask(expected : ValueCategory.PhoneNumber|ValueCategory.EmailAddress|ValueCategory.Location|ValueCategory.Time,
+        question : string,
+        args ?: Record<string, unknown>) : Promise<Ast.Value>;
+    askChoices(question : string, choices : string[]) : Promise<number>;
+}
 
 /**
  * The execution time dialogue agent.
@@ -47,10 +77,10 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
     private _engine : Engine;
     private _thingpedia : Tp.BaseClient;
     private _platform : Tp.BasePlatform;
-    private _dlg : DialogueLoop;
+    private _dlg : AbstractDialogueLoop;
     private _executor : StatementExecutor;
 
-    constructor(engine : Engine, dlg : DialogueLoop, debug : boolean) {
+    constructor(engine : Engine, dlg : AbstractDialogueLoop, debug : boolean) {
         super(engine.schemas, {
             debug: debug,
             locale: engine.platform.locale,
@@ -83,7 +113,7 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
         if (type === 'device') {
             question = this._dlg.interpolate(this._("You have multiple ${?“${name}” }${device} devices. Which one do you want to use?"), {
                 name,
-                device: Helpers.cleanKind(hint!)
+                device: cleanKind(hint!)
             })!;
         } else {
             question = this._dlg.interpolate(this._("Multiple contacts match “${name}”. Who do you mean?"), { name })!;
@@ -91,22 +121,62 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
         return this._dlg.askChoices(question, choices);
     }
 
-    protected async tryConfigureDevice(kind : string) : Promise<DeviceInfo> {
+    protected async tryConfigureDevice(kind : string) : Promise<DeviceInfo|null> {
         const factories = await this._thingpedia.getDeviceSetup([kind]);
         const factory = factories[kind];
-        if (factory && factory.type === 'none') {
+        if (!factory) {
+            await this._dlg.replyInterp(this._("You need to enable ${device} before you can use that command."), {
+                device: cleanKind(kind)
+            });
+            await this._dlg.replyLink(this._dlg.interpolate(this._("Configure ${device}"), {
+                device: cleanKind(kind)
+            }), "/devices/create");
+            return null;
+        }
+
+        if (factory.type === 'none') {
             const device = await this._engine.createDevice({ kind: factory.kind });
             return this._engine.getDeviceInfo(device.uniqueId!);
         } else {
-            this._dlg.icon = null;
             if (this._dlg.isAnonymous) {
-                await this._dlg.reply(this._("Sorry, I did not understand that. You might need to enable a new skill before I understand that command. To do so, please log in to your personal account."));
+                await this._dlg.replyInterp(this._("Sorry, to use ${device}, you must log in to your personal account."), {
+                    device: factory.text,
+                });
                 await this._dlg.replyLink(this._("Register for Almond"), "/user/register");
-            } else {
-                await this._dlg.reply(this._("Sorry, I did not understand that. You might need to enable a new skill before I understand that command."));
-                await this._dlg.replyLink(this._("Configure a new skill"), "/devices/create");
+                return null;
             }
-            throw new CancellationError(); // cancel the dialogue if we failed to set up a device
+
+            if (factory.type === 'multiple' && factory.choices.length === 0) {
+                await this._dlg.replyInterp(this._("You need to enable ${device} before you can use that command."), {
+                    device: factory.text
+                });
+            } else if (factory.type === 'multiple') {
+                await this._dlg.replyInterp(this._("You do not have a ${device} configured. You will need to enable ${choices:disjunction} before you can use that command."), {
+                    device: factory.text,
+                    choices: factory.choices.map((f) => f.text)
+                });
+            } else {
+                await this._dlg.replyInterp(this._("You need to enable ${device} before you can use that command."), {
+                    device: factory.text
+                });
+            }
+
+            // HACK: home assistant cannot be configured here, override the factory type
+            if (factory.type !== 'multiple' && factory.kind === 'io.home-assistant')
+                factory.type = 'interactive'; // this code is CHAOTIC EVIL as it exploits the unsoundness of TypeScript :D
+
+            switch (factory.type) {
+            case 'oauth2':
+                await this._dlg.replyLink(this._dlg.interpolate(this._("Configure ${device}"), { device: factory.text }),
+                    `/devices/oauth2/${factory.kind}?name=${encodeURIComponent(factory.text)}`);
+                break;
+            case 'multiple':
+                await this._dlg.replyLink(this._("Configure a new skill"), "/devices/create");
+                break;
+            default:
+                await this._dlg.replyLink(this._dlg.interpolate(this._("Configure ${device}"), { device: factory.text }), "/devices/create");
+            }
+            return null;
         }
     }
 
@@ -137,7 +207,8 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
         return contactApi.lookup(what, name);
     }
 
-    async askMissingContact(category : ValueCategory, name : string) : Promise<Ast.EntityValue> {
+    async askMissingContact(category : ValueCategory.EmailAddress|ValueCategory.PhoneNumber|ValueCategory.Contact,
+                            name : string) : Promise<Ast.EntityValue> {
         await this._dlg.replyInterp(this._("No contact matches “${name}”."), { name });
 
         // straight up ask for the target category
@@ -300,15 +371,17 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
                 const location = await this._tryGetCurrentLocation();
                 if (location)
                     value = new Ast.Value.Location(location);
+                else
+                    value = this._tryGetStoredVariable(Type.Location, variable);
                 break;
             }
             case '$context.location.home':
             case '$context.location.work':
-                value = this._tryGetStoredVariable(ThingTalk.Type.Location, variable);
+                value = this._tryGetStoredVariable(Type.Location, variable);
                 break;
             case '$context.time.morning':
             case '$context.time.evening':
-                value = this._tryGetStoredVariable(ThingTalk.Type.Time, variable);
+                value = this._tryGetStoredVariable(Type.Time, variable);
                 break;
             default:
                 throw new TypeError('Invalid variable ' + variable);
@@ -316,32 +389,27 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
         if (value !== null)
             return value;
 
-        let saveToContext = false;
         let question, type;
         switch (variable) {
         case '$context.location.current_location':
             question = this._("Where are you now?");
-            type = ValueCategory.Location;
+            type = ValueCategory.Location as const;
             break;
         case '$context.location.home':
             question = this._("What is your home address?");
-            type = ValueCategory.Location;
-            saveToContext = true;
+            type = ValueCategory.Location as const;
             break;
         case '$context.location.work':
             question = this._("What is your work address?");
-            type = ValueCategory.Location;
-            saveToContext = true;
+            type = ValueCategory.Location as const;
             break;
         case '$context.time.morning':
             question = this._("What time does your morning begin?");
-            type = ValueCategory.Time;
-            saveToContext = true;
+            type = ValueCategory.Time as const;
             break;
         case '$context.time.evening':
             question = this._("What time does your evening begin?");
-            type = ValueCategory.Time;
-            saveToContext = true;
+            type = ValueCategory.Time as const;
             break;
         }
 
@@ -355,79 +423,13 @@ export default class ExecutionDialogueAgent extends AbstractDialogueAgent<undefi
                 answer = await this.lookupLocation(answer.value.name, []);
         }
 
-        if (saveToContext) {
-            const sharedPrefs = this._platform.getSharedPreferences();
-            sharedPrefs.set('context-' + variable, answer.toJS());
-        }
+        const sharedPrefs = this._platform.getSharedPreferences();
+        sharedPrefs.set('context-' + variable, answer.toJS());
         return answer;
     }
 
-    protected getPreferredUnit(type : string) : string {
-        // const locale = dlg.locale; // this is not useful
+    getPreferredUnit(type : string) : string|undefined {
         const pref = this._platform.getSharedPreferences();
-        let preferredUnit = pref.get('preferred-' + type) as string|undefined;
-        // e.g. defaultTemperature will get from preferred-temperature
-        if (preferredUnit === undefined) {
-            switch (type) {
-            case 'temperature':
-                preferredUnit = this._getDefaultTemperatureUnit();
-                break;
-            default:
-                throw new Error('Invalid default unit');
-            }
-        }
-        return preferredUnit;
-    }
-
-    private _getDefaultTemperatureUnit() : string {
-        // this method is quite hacky because it accounts for the fact that the locale
-        // is always en-US, but we don't want
-
-        let preferredUnit = 'C'; // Below code checks if we are in US
-        if (this._platform.type !== 'cloud' && this._platform.type !== 'android') {
-            const realLocale = process.env.LC_ALL || process.env.LC_MEASUREMENT || process.env.LANG || 'C';
-            if (realLocale.indexOf('en_US') !== -1)
-                preferredUnit = 'F';
-        } else if (this._platform.type === 'cloud') {
-            const realLocale = process.env.TZ || 'UTC';
-            // timezones obtained from http://efele.net/maps/tz/us/
-            const usTimeZones = [
-                'America/New_York',
-                'America/Chicago',
-                'America/Denver',
-                'America/Los_Angeles',
-                'America/Adak',
-                'America/Yakutat',
-                'America/Juneau',
-                'America/Sitka',
-                'America/Metlakatla',
-                'America/Anchrorage',
-                'America/Nome',
-                'America/Phoenix',
-                'America/Honolulu',
-                'America/Boise',
-                'America/Indiana/Marengo',
-                'America/Indiana/Vincennes',
-                'America/Indiana/Tell_City',
-                'America/Indiana/Petersburg',
-                'America/Indiana/Knox',
-                'America/Indiana/Winamac',
-                'America/Indiana/Vevay',
-                'America/Kentucky/Louisville',
-                'America/Indiana/Indianapolis',
-                'America/Kentucky/Monticello',
-                'America/Menominee',
-                'America/North_Dakota/Center',
-                'America/North_Dakota/New_Salem',
-                'America/North_Dakota/Beulah',
-                'America/Boise',
-                'America/Puerto_Rico',
-                'America/St_Thomas',
-                'America/Shiprock',
-            ];
-            if (usTimeZones.indexOf(realLocale) !== -1)
-                preferredUnit = 'F';
-        }
-        return preferredUnit;
+        return pref.get('preferred-' + type) as string|undefined;
     }
 }

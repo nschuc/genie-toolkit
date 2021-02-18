@@ -29,33 +29,12 @@ import {
     ContextInfo,
     makeAgentReply,
     makeSimpleState,
-    sortByName,
     setOrAddInvocationParam,
     replaceAction,
 } from '../state_manip';
 
 
-function makeActionConfirmationPhrase(ctx : ContextInfo, action : Ast.Invocation) {
-    const ctxInvocation = C.getInvocation(ctx.next!);
-    if (!C.isSameFunction(ctxInvocation.schema!, action.schema!))
-        return null;
-
-    // all parameters have been slot-filled, otherwise we wouldn't be confirming...
-    assert(ctxInvocation.in_params.every((ip) => !ip.value.isUndefined));
-    if (action.in_params.length !== ctxInvocation.in_params.length)
-        return null;
-
-    ctxInvocation.in_params.sort(sortByName);
-    action.in_params.sort(sortByName);
-
-    for (let i = 0; i < action.in_params.length; i++) {
-        if (action.in_params[i].name !== ctxInvocation.in_params[i].name)
-            return null;
-
-        if (!action.in_params[i].value.equals(ctxInvocation.in_params[i].value))
-            return null;
-    }
-
+function makeActionConfirmationPhrase(ctx : ContextInfo) {
     return makeAgentReply(ctx, makeSimpleState(ctx, 'sys_confirm_action', null), null, Type.Boolean);
 }
 
@@ -74,7 +53,7 @@ function actionConfirmRejectPhrase(ctx : ContextInfo) {
     return makeSimpleState(clone, 'cancel', null);
 }
 
-function actionConfirmChangeParam(ctx : ContextInfo, answer : Ast.Value|Ast.InputParam) {
+function actionConfirmChangeParam(ctx : ContextInfo, answer : Ast.Value|C.InputParamSlot) {
     if (!ctx.next)
         return null;
     const action = C.getInvocation(ctx.next);
@@ -84,12 +63,12 @@ function actionConfirmChangeParam(ctx : ContextInfo, answer : Ast.Value|Ast.Inpu
         return null;
 
     // don't accept in params that don't apply to this specific action
-    const arg = ctx.nextFunctionSchema!.getArgument(answer.name);
-    if (!arg || !arg.is_input || !arg.type.equals(answer.value.getType()))
+    const arg = ctx.nextFunction!.getArgument(answer.ast.name);
+    if (!arg || !arg.is_input || !arg.type.equals(answer.ast.value.getType()))
         return null;
 
     const clone = action.clone();
-    setOrAddInvocationParam(clone, answer.name, answer.value);
+    setOrAddInvocationParam(clone, answer.ast.name, answer.ast.value);
     return replaceAction(ctx, 'execute', clone, 'confirmed');
 }
 

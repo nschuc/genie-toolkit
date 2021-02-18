@@ -20,7 +20,6 @@
 
 /*eslint no-misleading-character-class: off */
 
-import assert from 'assert';
 import { Inflectors } from 'en-inflectors';
 import { Tag } from 'en-pos';
 
@@ -88,24 +87,6 @@ const SPECIAL_TOKENS : { [key : string] : string } = {
     '-lsb-': ' [',
 };
 
-function capitalize(word : string) : string {
-    return word[0].toUpperCase() + word.substring(1);
-}
-
-const MUST_CAPITALIZE_TOKEN = new Set([
-    'i',
-
-    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
-    'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
-    'october', 'november', 'december',
-
-    // HACK
-    'chinese', 'italian', 'french', 'english', 'american',
-
-    'spotify', 'twitter', 'yelp'
-]);
-
-
 function isNumber(word : string) : boolean {
     // numbers with optional "," every 3 digits, cannot start with "."
     return /^\d{1,3}(,?\d{3})*(\.\d+)?$/.test(word);
@@ -121,6 +102,26 @@ function isZipcode(word : string) : boolean {
     return true;
 }
 
+// words that fail the usual vowel rule
+//
+// (the correct way to handle this would be a pronounciation dictionary
+// but that's too heavy handed)
+const INDEFINITE_ARTICLE_EXCEPTIONS = new Set([
+    // starts with semi-wovel:
+    'user', 'university', 'unique',
+
+    // pronounced letter by letter
+    'xkcd'
+]);
+
+function indefiniteArticle(word : string) {
+    let startsWithVowel = /^[aeiou]/.test(word);
+    if (INDEFINITE_ARTICLE_EXCEPTIONS.has(word))
+        startsWithVowel = !startsWithVowel;
+
+    return startsWithVowel ? 'an' : 'a';
+}
+
 /**
  * Implementation of a language pack for English, primarily optimized for
  * American English.
@@ -134,38 +135,70 @@ export default class EnglishLanguagePack extends DefaultLanguagePack {
         return this._tokenizer = new EnglishTokenizer();
     }
 
-    postprocessSynthetic(sentence : string, program : any, rng : () => number, forTarget = 'user') : string {
-        assert(rng);
+    getDefaultTemperatureUnit() : string {
+        return this.locale === 'en-us' ? 'F' : 'C';
+    }
+
+    protected _getPossibleUnits(baseUnit : string) : string[] {
+        if (this.locale !== 'en-us')
+            return super._getPossibleUnits(baseUnit);
+
+        switch (baseUnit) {
+        case 'm':
+            return ['in', 'ft', 'mi'];
+        case 'm2':
+            return ['in2', 'ft2', 'mi2'];
+        case 'm3':
+            // prefer liquid over solid units
+            // avoid cooking units
+            return ['floz', 'pt', 'qt', 'gal', 'in3', 'ft3', 'mi3'];
+        case 'mps':
+            return ['mps', 'mph'];
+        case 'kg':
+            return ['mg', 'oz', 'lb'];
+        case 'Pa':
+            return ['psi'];
+        case 'C':
+            return ['F', 'K'];
+        default:
+            return super._getPossibleUnits(baseUnit);
+        }
+    }
+
+    postprocessSynthetic(sentence : string, program : any, rng : (() => number)|null, forTarget = 'user') : string {
+        // normalize spaces
+        sentence = sentence.replace(/\s+/g, ' ');
+
         if (program.isProgram && program.principal !== null)
             sentence = replaceMeMy(sentence);
 
-        // if (!sentence.endsWith(' ?') && !sentence.endsWith(' !') && !sentence.endsWith(' .')) {
-        //     if ((forTarget === 'user' && coin(0.5, rng)) || forTarget === 'agent')
-        //         sentence = sentence.trim() + ' .';
-        // }
-        if (forTarget === 'user' && sentence.endsWith(' ?') && coin(0.5, rng))
+        if (!sentence.endsWith(' ?') && !sentence.endsWith(' !') && !sentence.endsWith(' .')) {
+            if ((forTarget === 'user' && rng && coin(0.5, rng)) || forTarget === 'agent')
+                sentence = sentence.trim() + ' .';
+        }
+        if (forTarget === 'user' && sentence.endsWith(' ?') && rng && coin(0.5, rng))
             sentence = sentence.substring(0, sentence.length-2);
 
         sentence = sentence.replace(/ (1|one|a) ([a-z]+)s /g, ' $1 $2 ');
 
-        if (forTarget === 'agent' || coin(0.5, rng))
+        if (forTarget === 'agent' || (rng && coin(0.5, rng)))
             sentence = sentence.replace(/ with (no|zero) /g, ' without ');
 
-        if (forTarget === 'user' && coin(0.5, rng))
+        if (forTarget === 'user' && rng && coin(0.5, rng))
             sentence = sentence.replace(/ has no /g, ' does not have ');
-        if (forTarget === 'user' && coin(0.5, rng))
+        if (forTarget === 'user' && rng && coin(0.5, rng))
             sentence = sentence.replace(/ have no /g, ' do not have ');
 
         // contractions
-        if (forTarget === 'agent' || coin(0.5, rng))
+        if (forTarget === 'agent' || (rng && coin(0.5, rng)))
             sentence = sentence.replace(/\b(does|do) not /g, '$1 n\'t ');
-        if (forTarget === 'user' && coin(0.5, rng))
+        if (forTarget === 'user' && rng && coin(0.5, rng))
             sentence = sentence.replace(/\b(he|she|it|what|who|where|when) (is|has) /g, '$1 \'s ');
-        if (forTarget === 'agent' || coin(0.5, rng))
+        if (forTarget === 'agent' || (rng && coin(0.5, rng)))
             sentence = sentence.replace(/\bi am /g, 'i \'m ');
-        if (forTarget === 'agent' || coin(0.5, rng))
+        if (forTarget === 'agent' || (rng && coin(0.5, rng)))
             sentence = sentence.replace(/\b(you|we|they) are /g, '$1 \'re ');
-        if (forTarget === 'user' && coin(0.5, rng))
+        if (forTarget === 'user' && rng && coin(0.5, rng))
             sentence = sentence.replace(/\b(i|you|he|she|we|they) (had|would) /g, '$1 \'d ');
 
         // adjust the grammar to resolve some edge cases introduced by the templates
@@ -173,21 +206,29 @@ export default class EnglishLanguagePack extends DefaultLanguagePack {
         sentence = sentence.replace(/\b(a|the) something\b/g, 'something');
 
         sentence = sentence.replace(/\b(a|the) my\b/g, 'my');
+        sentence = sentence.replace(/\b(a|the) the\b/g, 'the');
+        sentence = sentence.replace(/\b(a|the) today\b/g, 'today');
 
         //sentence = sentence.replace(/ a ([a-z]+) -s /g, ' $1 -s ');
 
         sentence = sentence.replace(/\b([a-z]+) -ly\b/g, '$1ly');
 
-        sentence = sentence.replace(/\ba (?!one )(?=[aeiou])\b/g, 'an ');
+        sentence = sentence.replace(/\ba ([a-z]+)\b/g, (_, word) => {
+            if (word === 'one')
+                return 'one';
+            return indefiniteArticle(word) + ' ' + word;
+        });
 
         sentence = sentence.replace(/\bnew (their|my|the|a)\b/, '$1 new');
 
         sentence = sentence.replace(/\b's (my|their|his|her)\b/, `'s`); //'
 
-        if (forTarget === 'user' && coin(0.5, rng))
+        if (forTarget === 'user' && rng && coin(0.5, rng))
             sentence = sentence.replace(/\bin here\b/, 'here'); //'
 
         sentence = sentence.replace(/\bin (home|work)\b/, 'at $1');
+
+        sentence = sentence.replace(/\bat the (morning|evening)\b/, 'in the $1');
 
         sentence = sentence.replace(/\bon (today|tomorrow|(?:(this|last|next) (?:week|month|year)))\b/, '$1');
 
@@ -200,13 +241,10 @@ export default class EnglishLanguagePack extends DefaultLanguagePack {
         });
         sentence = sentence.replace(/\b(it(?: 's| is)) an? ([a-z]+)\b/, (_, pre, word) => {
             const inflected = new Inflectors(word).toSingular();
-            return pre + ' ' + inflected;
+            return pre + ' ' + indefiniteArticle(inflected) + ' ' + inflected;
         });
         sentence = sentence.replace(/\b(they(?: 're| are) [a-zA-Z' ]+?) (which|that) is\b/, '$1 $2 are');
         sentence = sentence.replace(/\b(they(?: 're| are) [a-zA-Z' ]+?) (which|that) has\b/, '$1 $2 have');
-
-        // remove extra # introduced by annotations, and not yet been replaced by value
-        sentence = sentence.replace(/#/g, '');
 
         return sentence.trim();
     }
@@ -238,38 +276,15 @@ export default class EnglishLanguagePack extends DefaultLanguagePack {
         return sentence;
     }
 
-    postprocessNLG(answer : string, entities : { [key : string] : any }) : string {
-        // simple true-casing: uppercase all letters at the beginning of the sentence
-        // and after a period, question or exclamation mark
-        answer = answer.replace(/(^| [.?!] )([a-z])/g, (_, prefix, letter) => prefix + letter.toUpperCase());
-
-        const tokens = answer.split(' ').map((token) => {
-            if (token in entities) {
-                if (token.startsWith('GENERIC_ENTITY_'))
-                    return (entities[token].display || entities[token].value);
-                return String(entities[token]);
-            }
-
-            // capitalize certain tokens that should be capitalized in English
-            if (MUST_CAPITALIZE_TOKEN.has(token))
-                return capitalize(token);
-            return token;
-        });
-        answer = this.detokenizeSentence(tokens);
-
-        // remove duplicate spaces
-        answer = answer.replace(/\s+/g, ' ');
-
-        // sometimes, we end up with two periods at the end of a sentence, because
-        // a #[result] phrase includes a period, or because a value includes a period
-        // (this happens with jokes)
-        // clean that up
-        answer = answer.replace(/\.\.$/, '.');
-
-        return answer;
-    }
-
     pluralize(name : string) : string {
+        // check for "foo in bla" / "foo on bla" cases, and pluralize
+        // only the first part
+        const match = / (in|on) /.exec(name);
+        if (match) {
+            return this.pluralize(name.substring(0, match.index))
+                + name.substring(match.index);
+        }
+
         if (!name.includes(' ')) {
             if (new Tag([name]).initial().tags[0] === 'NN')
                 return new Inflectors(name).toPlural();
@@ -488,3 +503,16 @@ EnglishLanguagePack.prototype.SINGLE_DEVICE_TEMPLATES = [
 ];
 
 EnglishLanguagePack.prototype.DEFINITE_ARTICLE_REGEXP = /^the /;
+
+EnglishLanguagePack.prototype.MUST_CAPITALIZE_TOKEN = new Set([
+    'i',
+
+    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+    'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
+    'october', 'november', 'december',
+
+    // HACK
+    'chinese', 'italian', 'french', 'english', 'american',
+
+    'spotify', 'twitter', 'yelp', 'google', 'facebook',
+]);

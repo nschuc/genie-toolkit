@@ -48,11 +48,15 @@ export interface SimulationDatabase {
 
 interface SimulatorOptions {
     locale : string;
+    timezone : string|undefined;
     schemaRetriever : SchemaRetriever;
     rng : () => number;
     database ?: SimulationDatabase;
     overrides ?: Map<string, string>;
 }
+
+type RawExecutionResult = Array<[string, Record<string, unknown>]>;
+type ExecutionResult = [Ast.DialogueHistoryResultList, RawExecutionResult];
 
 export class ThingTalkSimulatorState {
     private _locale : string;
@@ -69,7 +73,7 @@ export class ThingTalkSimulatorState {
         this._database = options.database;
         this._overrides = options.overrides || new Map;
 
-        this._execEnv = new SimulationExecEnvironment(this._locale, this._schemas, this._database, {
+        this._execEnv = new SimulationExecEnvironment(this._locale, options.timezone, this._schemas, this._database, {
             rng: this._rng
         });
     }
@@ -99,8 +103,9 @@ export class ThingTalkSimulatorState {
         return compiled;
     }
 
-    async simulate(stmt : Ast.ExpressionStatement, compiled : CompiledProgram) : Promise<Ast.DialogueHistoryResultList> {
+    async simulate(stmt : Ast.ExpressionStatement, compiled : CompiledProgram) : Promise<ExecutionResult> {
         const results : Ast.DialogueHistoryResultItem[] = [];
+        const rawResults : RawExecutionResult = [];
         let error : Ast.Value|null = null;
         const generator = new ResultGenerator(this._rng, this._overrides);
         for (const slot of stmt.iterateSlots2()) {
@@ -112,6 +117,7 @@ export class ThingTalkSimulatorState {
         this._execEnv.output = async (outputType : string, outputValue : { [key : string] : unknown }) => {
             const mapped = new Ast.DialogueHistoryResultItem(null, await this._mapResult(outputType, outputValue));
             results.push(mapped);
+            rawResults.push([outputType, outputValue]);
         };
         this._execEnv.reportError = async (msg, err) => {
             if (!(err instanceof SimulatedError)) {
@@ -137,8 +143,8 @@ export class ThingTalkSimulatorState {
         }
 
         const numResults = results.length;
-        return new Ast.DialogueHistoryResultList(null, results.slice(0, PAGE_SIZE),
-            new Ast.Value.Number(Math.min(MORE_SIZE, numResults)), numResults > MORE_SIZE, error);
+        return [new Ast.DialogueHistoryResultList(null, results.slice(0, PAGE_SIZE),
+            new Ast.Value.Number(Math.min(MORE_SIZE, numResults)), numResults > MORE_SIZE, error), rawResults];
     }
 
     private _inferType(jsValue : unknown) : Type {
@@ -251,11 +257,11 @@ export default class ThingTalkStatementSimulator {
     }
 
     async executeStatement(stmt : Ast.ExpressionStatement,
-                           execState : ThingTalkSimulatorState) : Promise<[Ast.DialogueHistoryResultList, ThingTalkSimulatorState]> {
+                           execState : ThingTalkSimulatorState) : Promise<[Ast.DialogueHistoryResultList, RawExecutionResult, ThingTalkSimulatorState]> {
         if (stmt.stream) {
             // nothing to do, this always returns nothing
             return [new Ast.DialogueHistoryResultList(null, [],
-                new Ast.Value.Number(0), false, null), execState];
+                new Ast.Value.Number(0), false, null), [], execState];
         }
 
         if (execState === undefined)
@@ -263,7 +269,7 @@ export default class ThingTalkStatementSimulator {
 
         // there is no way around this, we need to compile and run the program!
         const compiled = await execState.compile(stmt, this.cache);
-        const resultList = await execState.simulate(stmt, compiled);
-        return [resultList, execState];
+        const [resultList, rawResults] = await execState.simulate(stmt, compiled);
+        return [resultList, rawResults, execState];
     }
 }

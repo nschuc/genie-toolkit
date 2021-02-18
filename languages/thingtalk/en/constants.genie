@@ -18,12 +18,11 @@
 //
 // Author: Giovanni Campagna <gcampagn@cs.stanford.edu>
 
+import assert from 'assert';
 import { Ast, Type } from 'thingtalk';
 
 import * as C from '../ast_manip';
-
-// import thingpedia info
-import _tpLoader from '../load-thingpedia';
+import ThingpediaLoader from '../load-thingpedia';
 
 constant_Number : Ast.NumberValue = {
     // `turking` is a flags that controls a group of grammar rules
@@ -333,27 +332,24 @@ constant_Location : Ast.LocationValue = {
 }
 
 constant_pairs : [Ast.Value, Ast.Value] = {
-    c1:constant_Any 'and' c2:constant_Any => {
-        if (!c1.getType().equals(c2.getType()))
-            return null;
+    c1:constant_Any 'and' c2:constant_Any with { type = c1.type } => {
+        assert(c1.getType().equals(c2.getType()));
         if (c1.equals(c2))
             return null;
         return [c1, c2];
     };
 }
 constant_or_pairs : [Ast.Value, Ast.Value] = {
-    c1:constant_Any 'or' c2:constant_Any => {
-        if (!c1.getType().equals(c2.getType()))
-            return null;
+    c1:constant_Any 'or' c2:constant_Any with { type = c1.type } => {
+        assert(c1.getType().equals(c2.getType()));
         if (c1.equals(c2))
             return null;
         return [c1, c2];
     };
 }
 constant_nor_pairs : [Ast.Value, Ast.Value] = {
-    c1:constant_Any 'nor' c2:constant_Any => {
-        if (!c1.getType().equals(c2.getType()))
-            return null;
+    c1:constant_Any 'nor' c2:constant_Any with { type = c1.type } => {
+        assert(c1.getType().equals(c2.getType()));
         if (c1.equals(c2))
             return null;
         return [c1, c2];

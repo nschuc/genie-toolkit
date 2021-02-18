@@ -33,18 +33,21 @@ import * as MTurk from './dataset-tools/mturk';
 import * as Training from './training';
 import * as Evaluation from './dataset-tools/evaluation';
 import * as ParserClient from './prediction/parserclient';
+import ExactMatcher from './prediction/exact';
 
 import * as I18n from './i18n';
 import parallelize from './utils/parallelize';
 import * as EntityUtils from './utils/entity-utils';
 import * as IpAddressUtils from './engine/util/ip_address';
 import * as ThingTalkUtils from './utils/thingtalk';
+import * as BTrie from './utils/btrie';
 
 import SpeechHandler from './speech/speech_handler';
 import AssistantEngine from './engine';
 
 import SentenceGenerator from './sentence-generator/generator';
 import * as SentenceGeneratorRuntime from './sentence-generator/runtime';
+import * as SentenceGeneratorTypes from './sentence-generator/types';
 
 export {
     // sentence generation
@@ -52,6 +55,7 @@ export {
     DialogueGenerator,
     SentenceGenerator,
     SentenceGeneratorRuntime,
+    SentenceGeneratorTypes,
 
     // dataset manipulation
     DatasetParser,
@@ -66,12 +70,14 @@ export {
     Training,
     Evaluation,
     ParserClient,
+    ExactMatcher,
 
     // semi-unstable API
     parallelize,
     EntityUtils,
     IpAddressUtils,
     ThingTalkUtils,
+    BTrie,
 
     // dialogue agent
     SpeechHandler,

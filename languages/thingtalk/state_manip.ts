@@ -21,10 +21,14 @@
 
 import assert from 'assert';
 import * as ThingTalk from 'thingtalk';
-import { Ast, } from 'thingtalk';
+import { Ast, Type } from 'thingtalk';
+import { SentenceGeneratorTypes } from 'genie-toolkit';
+export type AgentReplyRecord = SentenceGeneratorTypes.AgentReplyRecord<Ast.DialogueState>;
 
 import * as C from './ast_manip';
-import { isExecutable } from './utils';
+import * as keyfns from './keyfns';
+import { SlotBag } from './slot_bag';
+import ThingpediaLoader from './load-thingpedia';
 
 // NOTE: this version of arraySubset uses ===
 // the one in array_utils uses .equals()
@@ -54,9 +58,7 @@ function arraySubset<T>(small : T[], big : T[]) : boolean {
 // in the templates
 // templates can be combined though
 
-const POLICY_NAME = 'org.thingpedia.dialogue.transaction';
-
-const INITIAL_CONTEXT_INFO = {};
+export const POLICY_NAME = 'org.thingpedia.dialogue.transaction';
 
 const LARGE_RESULT_THRESHOLD = 50;
 function isLargeResultSet(result : Ast.DialogueHistoryResultList) : boolean {
@@ -111,7 +113,7 @@ export class ResultInfo {
     hasEmptyResult : boolean;
     hasSingleResult : boolean;
     hasLargeResult : boolean;
-    hasID : boolean;
+    idType : Type|null;
 
     constructor(state : Ast.DialogueState,
                 item : Ast.DialogueHistoryItem) {
@@ -147,8 +149,9 @@ export class ResultInfo {
         this.hasEmptyResult = item.results.results.length === 0;
         this.hasSingleResult = item.results.results.length === 1;
         this.hasLargeResult = isLargeResultSet(item.results);
-        this.hasID = item.results.results.length > 0 &&
-            !!item.results.results[0].value.id;
+
+        const id = stmt.last.schema!.getArgument('id');
+        this.idType = id && !id.is_input ? id.type : null;
     }
 }
 
@@ -167,7 +170,7 @@ export class NextStatementInfo {
 
         this.chainParameter = null;
         this.chainParameterFilled = false;
-        this.isComplete = isExecutable(nextstmt);
+        this.isComplete = nextItem.isExecutable();
 
         if (!this.isAction)
             return;
@@ -178,6 +181,7 @@ export class NextStatementInfo {
 
         if (!currentItem || !resultInfo || !resultInfo.isTable)
             return;
+
         const currentstmt = currentItem.stmt;
         const tableschema = currentstmt.expression.schema!;
         const idType = tableschema.getArgType('id');
@@ -207,22 +211,58 @@ export class NextStatementInfo {
     }
 }
 
+function toID(value : Ast.Value|undefined) {
+    if (value === undefined)
+        return null;
+    const jsValue = value.toJS();
+    if (typeof jsValue === 'number')
+        return jsValue;
+    else if (jsValue === null || jsValue === undefined)
+        return null;
+    else
+        return String(jsValue);
+}
+
 export class ContextInfo {
+    loader : ThingpediaLoader;
+    contextTable : SentenceGeneratorTypes.ContextTable;
+
     state : Ast.DialogueState;
-    currentFunctionSchema : Ast.FunctionDef|null;
-    currentFunction : string|null;
-    currentTableSchema : Ast.FunctionDef|null;
+    currentFunction : Ast.FunctionDef|null;
+    currentTableFunction : Ast.FunctionDef|null;
     resultInfo : ResultInfo|null;
     isMultiDomain : boolean;
     previousDomainIdx : number|null;
     currentIdx : number|null;
-    nextFunctionSchema : Ast.FunctionDef|null;
-    nextFunction : string|null;
+    nextFunction : Ast.FunctionDef|null;
     nextIdx : number|null;
     nextInfo : NextStatementInfo|null;
     aux : any;
 
-    constructor(state : Ast.DialogueState,
+    key : {
+        currentFunction : string|null;
+        nextFunction : string|null;
+        currentTableFunction : string|null;
+
+        // type of ID parameter of current result
+        // this is usually the same as currentFunction, but can be null
+        // the current function doesn't return an ID, and can be different
+        // if the current function is not the primary query for this ID type
+        // it is used to match names and contexts
+        idType : Type|null;
+
+        // IDs of the top 3 results (entity values or numeric IDs)
+        id0 : string|number|null;
+        id1 : string|number|null;
+        id2 : string|number|null;
+
+        // number of results
+        resultLength : number;
+    };
+
+    constructor(loader : ThingpediaLoader,
+                contextTable : SentenceGeneratorTypes.ContextTable,
+                state : Ast.DialogueState,
                 currentTableSchema : Ast.FunctionDef|null,
                 currentFunctionSchema : Ast.FunctionDef|null,
                 resultInfo : ResultInfo|null,
@@ -232,18 +272,14 @@ export class ContextInfo {
                 nextFunctionSchema : Ast.FunctionDef|null,
                 nextInfo : NextStatementInfo|null,
                 aux : any = null) {
+        this.loader = loader;
+        this.contextTable = contextTable;
         this.state = state;
 
         assert(currentFunctionSchema === null || currentFunctionSchema instanceof Ast.FunctionDef);
-        if (currentFunctionSchema === null) {
-            this.currentFunctionSchema = null;
-            this.currentFunction = null;
-        } else {
-            this.currentFunctionSchema = currentFunctionSchema;
-            this.currentFunction = currentFunctionSchema.class!.name + ':' + currentFunctionSchema.name;
-        }
+        this.currentFunction = currentFunctionSchema;
         assert(currentTableSchema === null || currentTableSchema instanceof Ast.FunctionDef);
-        this.currentTableSchema = currentTableSchema;
+        this.currentTableFunction = currentTableSchema;
 
         this.resultInfo = resultInfo;
         this.isMultiDomain = previousDomainIdx !== null;
@@ -251,16 +287,34 @@ export class ContextInfo {
         this.currentIdx = currentIdx;
 
         assert(nextFunctionSchema === null || nextFunctionSchema instanceof Ast.FunctionDef);
-        if (nextFunctionSchema === null) {
-            this.nextFunctionSchema = null;
-            this.nextFunction = null;
-        } else {
-            this.nextFunctionSchema = nextFunctionSchema;
-            this.nextFunction = nextFunctionSchema.class!.name + ':' + nextFunctionSchema.name;
-        }
+        this.nextFunction = nextFunctionSchema;
         this.nextIdx = nextIdx;
         this.nextInfo = nextInfo;
         this.aux = aux;
+
+        this.key = {
+            currentFunction: this.currentFunction ? this.currentFunction.qualifiedName : null,
+            nextFunction: this.nextFunction ? this.nextFunction.qualifiedName : null,
+            currentTableFunction: this.currentTableFunction ? this.currentTableFunction.qualifiedName : null,
+
+            idType: null,
+            id0: null,
+            id1: null,
+            id2: null,
+            resultLength: 0
+        };
+        if (this.resultInfo) {
+            this.key.idType = this.resultInfo.idType;
+
+            const results = this.results!;
+            this.key.resultLength = results.length;
+            if (results.length > 0)
+                this.key.id0 = toID(results[0].value.id);
+            if (results.length > 1)
+                this.key.id1 = toID(results[1].value.id);
+            if (results.length > 2)
+                this.key.id2 = toID(results[2].value.id);
+        }
     }
 
     toString() : string {
@@ -292,17 +346,33 @@ export class ContextInfo {
     }
 
     clone() {
-        return new ContextInfo(this.state.clone(),
-            this.currentTableSchema,
-            this.currentFunctionSchema,
+        return new ContextInfo(
+            this.loader,
+            this.contextTable,
+            this.state.clone(),
+            this.currentTableFunction,
+            this.currentFunction,
             this.resultInfo,
             this.previousDomainIdx, this.currentIdx,
-            this.nextIdx, this.nextFunctionSchema, this.nextInfo,
-            this.aux);
+            this.nextIdx, this.nextFunction, this.nextInfo,
+            this.aux
+        );
     }
 }
 
-function getContextInfo(state : Ast.DialogueState) : ContextInfo {
+export function contextKeyFn(ctx : ContextInfo) {
+    return ctx.key;
+}
+
+export function initialContextInfo(loader : ThingpediaLoader, contextTable : SentenceGeneratorTypes.ContextTable) {
+    return new ContextInfo(loader, contextTable,
+        new Ast.DialogueState(null, POLICY_NAME, 'sys_init', [], []),
+        null, null, null, null, null, null, null, null);
+}
+
+export function getContextInfo(loader : ThingpediaLoader,
+                               state : Ast.DialogueState,
+                               contextTable : SentenceGeneratorTypes.ContextTable) : ContextInfo {
     let nextItemIdx = null, nextInfo = null, currentFunction = null, currentTableFunction = null,
         nextFunction = null, currentDevice = null, currentResultInfo = null,
         previousDomainItemIdx = null, currentItemIdx = null;
@@ -350,11 +420,11 @@ function getContextInfo(state : Ast.DialogueState) : ContextInfo {
     if (previousDomainItemIdx !== null)
         assert(currentItemIdx !== null && previousDomainItemIdx <= currentItemIdx);
 
-    return new ContextInfo(state, currentTableFunction, currentFunction, currentResultInfo,
+    return new ContextInfo(loader, contextTable, state, currentTableFunction, currentFunction, currentResultInfo,
         previousDomainItemIdx, currentItemIdx, nextItemIdx, nextFunction, nextInfo);
 }
 
-function isUserAskingResultQuestion(ctx : ContextInfo) : boolean {
+export function isUserAskingResultQuestion(ctx : ContextInfo) : boolean {
     // is the user asking a question about the result (or a specific element), or refining a search?
     // we say it's a question if the user is asking a projection question, and it's not the first turn,
     // and the projection was different at the previous turn
@@ -437,9 +507,6 @@ function makeSimpleState(ctx : ContextInfo,
     // proposed ones
 
     const newState = new Ast.DialogueState(null, POLICY_NAME, dialogueAct, dialogueActParam, []);
-    if (ctx === INITIAL_CONTEXT_INFO)
-        return newState;
-
     for (let i = 0; i < ctx.state.history.length; i++) {
         if (ctx.state.history[i].confirm === 'proposed')
             break;
@@ -659,18 +726,17 @@ function addQueryAndAction(ctx : ContextInfo,
     return addNewItem(ctx, dialogueAct, null, confirm, newTableHistoryItem, newActionHistoryItem);
 }
 
+export function makeContextPhrase(symbol : number, value : ContextInfo, utterance = '', priority = 0) : SentenceGeneratorTypes.ContextPhrase {
+    return { symbol, utterance, value, priority, key: value.key };
+}
+export function makeExpressionContextPhrase(symbol : number, value : Ast.Expression, utterance : string, priority = 0) : SentenceGeneratorTypes.ContextPhrase {
+    return { symbol, utterance, value, priority, key: keyfns.expressionKeyFn(value) };
+}
+
 export interface AgentReplyOptions {
     end ?: boolean;
     raw ?: boolean;
-}
-
-export interface AgentReplyRecord {
-    state : Ast.DialogueState,
-    context : ContextInfo,
-    tags : string[],
-    expect : ThingTalk.Type|null,
-    end : boolean;
-    raw : boolean;
+    numResults ?: number;
 }
 
 /**
@@ -687,24 +753,26 @@ function makeAgentReply(ctx : ContextInfo,
                         aux : unknown = null,
                         expectedType : ThingTalk.Type|null = null,
                         options : AgentReplyOptions = {}) : AgentReplyRecord {
+    const contextTable = ctx.contextTable;
+
     assert(state instanceof Ast.DialogueState);
     assert(state.dialogueAct.startsWith('sys_'));
     assert(expectedType === null || expectedType instanceof ThingTalk.Type);
 
-    const newContext = getContextInfo(state);
+    const newContext = getContextInfo(ctx.loader, state, contextTable);
     // set the auxiliary information, which is used by the semantic functions of the user
     // to see if the continuation is compatible with the specific reply from the agent
     newContext.aux = aux;
 
     let mainTag;
     if (state.dialogueAct === 'sys_generic_search_question')
-        mainTag = 'ctx_sys_search_question';
+        mainTag = contextTable.ctx_sys_search_question;
     else if (state.dialogueAct.endsWith('_question') && state.dialogueAct !== 'sys_search_question')
-        mainTag = 'ctx_' + state.dialogueAct.substring(0, state.dialogueAct.length - '_question'.length);
+        mainTag = contextTable['ctx_' + state.dialogueAct.substring(0, state.dialogueAct.length - '_question'.length)];
     else if (state.dialogueAct.startsWith('sys_recommend_') && state.dialogueAct !== 'sys_recommend_one')
-        mainTag = 'ctx_sys_recommend_many';
+        mainTag = contextTable.ctx_sys_recommend_many;
     else
-        mainTag = 'ctx_' + state.dialogueAct;
+        mainTag = contextTable['ctx_' + state.dialogueAct];
 
     // if true, the interaction is done and the agent should stop listening
     // these dialogue acts are considered to "end" the conversation:
@@ -722,13 +790,21 @@ function makeAgentReply(ctx : ContextInfo,
     return {
         state,
         context: newContext,
-        tags: ['ctx_sys_any', mainTag, ...getContextTags(newContext)],
+        contextPhrases: [
+            makeContextPhrase(ctx.contextTable.ctx_sys_any, newContext),
+            makeContextPhrase(mainTag, newContext),
+            ...getContextPhrases(newContext)
+        ],
         expect: expectedType,
 
         end: end,
         // if true, enter raw mode for this user's turn
         // (this is used for slot filling free-form strings)
-        raw: !!options.raw
+        raw: !!options.raw,
+
+        // the number of results we're describing at this turn
+        // (this affects the number of result cards to show)
+        numResults: options.numResults || 0,
     };
 }
 
@@ -740,34 +816,35 @@ function setEndBit(reply : AgentReplyRecord, value : boolean) : AgentReplyRecord
 }
 
 function actionShouldHaveResult(ctx : ContextInfo) : boolean {
-    const schema = ctx.currentFunctionSchema!;
+    const schema = ctx.currentFunction!;
     return Object.keys(schema.out).length > 0;
 }
 
-function tagContextForAgent(ctx : ContextInfo) : string[] {
+export function tagContextForAgent(ctx : ContextInfo) : number[] {
+    const contextTable = ctx.contextTable;
+
     switch (ctx.state.dialogueAct){
     case 'end':
         // no continuations are possible after explicit "end" (which means the user said
         // "no thanks" after the agent asked "is there anything else I can do for you")
         // but we still tag the context to generate something in inference mode
-        return ['ctx_end'];
+        return [contextTable.ctx_end];
 
     case 'greet':
-        assert(ctx.state.history.length === 0, `expected empty history for greet`);
-        return ['ctx_greet'];
+        return [contextTable.ctx_greet];
 
     case 'reinit':
-        return ['ctx_reinit'];
+        return [contextTable.ctx_reinit];
 
     case 'cancel':
-        return ['ctx_cancel'];
+        return [contextTable.ctx_cancel];
 
     case 'action_question':
-        return ['ctx_completed_action_success'];
+        return [contextTable.ctx_completed_action_success];
 
     case 'learn_more':
         assert(ctx.results);
-        return ['ctx_learn_more'];
+        return [contextTable.ctx_learn_more];
 
     case 'execute':
     case 'ask_recommend':
@@ -777,9 +854,9 @@ function tagContextForAgent(ctx : ContextInfo) : string[] {
                 // we don't need to fill any parameter from the current query
 
                 if (ctx.nextInfo.isComplete)
-                    return ['ctx_confirm_action'];
+                    return [contextTable.ctx_confirm_action];
                 else
-                    return ['ctx_incomplete_action_after_search'];
+                    return [contextTable.ctx_incomplete_action_after_search];
             }
         }
 
@@ -787,52 +864,52 @@ function tagContextForAgent(ctx : ContextInfo) : string[] {
         assert(ctx.resultInfo, `expected result info`);
         if (!ctx.resultInfo.isTable) {
             if (ctx.resultInfo.hasError)
-                return ['ctx_completed_action_error'];
+                return [contextTable.ctx_completed_action_error];
             else if (ctx.resultInfo.hasEmptyResult && actionShouldHaveResult(ctx))
-                return ['ctx_empty_search_command'];
+                return [contextTable.ctx_empty_search_command];
             else
-                return ['ctx_completed_action_success'];
+                return [contextTable.ctx_completed_action_success];
         }
 
         if (ctx.resultInfo.hasEmptyResult) {
             // note: aggregation cannot be empty (it would be zero)
-            return ['ctx_empty_search_command'];
+            return [contextTable.ctx_empty_search_command];
         }
 
         if (!ctx.resultInfo.isList) {
-            return ['ctx_display_nonlist_result'];
+            return [contextTable.ctx_display_nonlist_result];
         } else if (ctx.resultInfo.isQuestion) {
             if (ctx.resultInfo.isAggregation) {
                 // "how many restaurants nearby have more than 500 reviews?"
-                return ['ctx_aggregation_question'];
+                return [contextTable.ctx_aggregation_question];
             } else if (ctx.resultInfo.argMinMaxField !== null) {
                 // these are treated as single result questions, but
                 // the context is tagged as ctx_with_result_argminmax instead of
                 // ctx_with_result_noquestion
                 // so the answer is worded differently
-                return ['ctx_single_result_search_command', 'ctx_complete_search_command'];
+                return [contextTable.ctx_single_result_search_command, contextTable.ctx_complete_search_command];
             } else if (ctx.resultInfo.hasSingleResult) {
                 // "what is the rating of Terun?"
                 // FIXME if we want to answer differently, we need to change this one
-                return ['ctx_single_result_search_command', 'ctx_complete_search_command'];
+                return [contextTable.ctx_single_result_search_command, contextTable.ctx_complete_search_command];
             } else if (ctx.resultInfo.hasLargeResult) {
                 // "what's the food and price range of restaurants nearby?"
                 // we treat these the same as "find restaurants nearby", but we make sure
                 // that the necessary fields are computed
-                return ['ctx_search_command', 'ctx_complete_search_command'];
+                return [contextTable.ctx_search_command, contextTable.ctx_complete_search_command];
             } else {
                 // "what's the food and price range of restaurants nearby?"
                 // we treat these the same as "find restaurants nearby", but we make sure
                 // that the necessary fields are computed
-                return ['ctx_complete_search_command'];
+                return [contextTable.ctx_complete_search_command];
             }
         } else {
             if (ctx.resultInfo.hasSingleResult) // we can recommend
-                return ['ctx_single_result_search_command', 'ctx_complete_search_command'];
+                return [contextTable.ctx_single_result_search_command, contextTable.ctx_complete_search_command];
             else if (ctx.resultInfo.hasLargeResult && ctx.state.dialogueAct !== 'ask_recommend') // we can refine
-                return ['ctx_search_command', 'ctx_complete_search_command'];
+                return [contextTable.ctx_search_command, contextTable.ctx_complete_search_command];
             else
-                return ['ctx_complete_search_command'];
+                return [contextTable.ctx_complete_search_command];
         }
 
     default:
@@ -852,59 +929,193 @@ function ctxCanHaveRelatedQuestion(ctx : ContextInfo) : boolean {
     return !!(related && related.length);
 }
 
-function getContextTags(ctx : ContextInfo) : string[] {
-    const tags : string[] = [];
+function makeErrorContextPhrase(ctx : ContextInfo,
+                                error : Ast.EnumValue) {
+    const contextTable = ctx.contextTable;
+    const describer = ctx.loader.describer;
+
+    const currentFunction = ctx.currentFunction!;
+    const phrases = ctx.loader.getErrorMessages(currentFunction.qualifiedName)[error.value];
+    if (!phrases)
+        return null;
+
+    const action = C.getInvocation(ctx.current!);
+
+    // try all phrases, find the first that we can replace correctly
+    for (const candidate of phrases) {
+        const bag = new SlotBag(currentFunction);
+
+        let utterance = '';
+        let good = true;
+        for (const chunk of candidate.split(' ')) {
+            if (chunk.startsWith('$') && chunk !== '$$') {
+                const [, param1, param2,] = /^\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})$/.exec(chunk)!;
+                const param = param1 || param2;
+                assert(param);
+                // TODO use opt
+
+                let found = null;
+                for (const in_param of action.in_params) {
+                    if (in_param.name === param) {
+                        found = in_param.value;
+                        break;
+                    }
+                }
+                if (!found) {
+                    good = false;
+                    break;
+                }
+                utterance += ' ' + describer.describeArg(found);
+                bag.set(param, found);
+            } else {
+                utterance += ' ' + chunk;
+            }
+        }
+        utterance = utterance.trim();
+
+        if (good) {
+            const value : C.ErrorMessage = { code: error.value, bag };
+            return { symbol: contextTable.ctx_thingpedia_error_message, utterance, value, priority: 0, key: keyfns.errorMessageKeyFn(value) };
+        }
+    }
+
+    return null;
+}
+
+function makeResultContextPhrase(ctx : ContextInfo,
+                                 result : Ast.DialogueHistoryResultItem) {
+    const contextTable = ctx.contextTable;
+    const describer = ctx.loader.describer;
+
+    const currentFunction = ctx.currentFunction!;
+    const phrases = ctx.loader.getResultStrings(currentFunction.qualifiedName);
+
+    // try all phrases, find the first that we can replace correctly
+    for (const candidate of phrases) {
+        const bag = new SlotBag(currentFunction);
+
+        let utterance = '';
+        let good = true;
+        for (const chunk of candidate.split(' ')) {
+            if (chunk.startsWith('$') && chunk !== '$$') {
+                const [, param1, param2,] = /^\$(?:\$|([a-zA-Z0-9_]+(?![a-zA-Z0-9_]))|{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_-]+))?})$/.exec(chunk)!;
+                const param = param1 || param2;
+                assert(param);
+                // TODO use opt
+
+                const value = result.value[param];
+                if (!value) {
+                    good = false;
+                    break;
+                }
+                utterance += ' ' + describer.describeArg(value);
+                bag.set(param, value);
+            } else {
+                utterance += ' ' + chunk;
+            }
+        }
+        utterance = utterance.trim();
+
+        if (good)
+            return { symbol: contextTable.ctx_thingpedia_result, utterance, value: bag, priority: 0, key: keyfns.slotBagKeyFn(bag) };
+    }
+
+    return null;
+}
+
+export function getContextPhrases(ctx : ContextInfo) : SentenceGeneratorTypes.ContextPhrase[] {
+    const contextTable = ctx.contextTable;
+
+    const phrases : SentenceGeneratorTypes.ContextPhrase[] = [];
+    const describer = ctx.loader.describer;
+
+    // make phrases that describe the current and next action
+    // these are used by the agent to form confirmations
+    const current = ctx.current;
+    if (current) {
+        const lastQuery = current.stmt.lastQuery;
+        if (lastQuery) {
+            phrases.push(makeExpressionContextPhrase(contextTable.ctx_current_query, lastQuery,
+                                                     describer.describeQuery(lastQuery)));
+        }
+
+        if (current.results!.error instanceof Ast.EnumValue) {
+            const phrase = makeErrorContextPhrase(ctx, current.results!.error);
+            if (phrase)
+                phrases.push(phrase);
+        } else {
+            const results = current.results!.results;
+            if (results.length > 0) {
+                const topResult = results[0];
+                const phrase = makeResultContextPhrase(ctx, topResult);
+                if (phrase)
+                    phrases.push(phrase);
+            }
+        }
+    }
+
+    const next = ctx.next;
+    if (next) {
+        phrases.push(makeContextPhrase(contextTable.ctx_next_statement, ctx,
+                                       describer.describeExpressionStatement(next.stmt)));
+
+        const lastQuery = next.stmt.lastQuery;
+        if (lastQuery) {
+            phrases.push(makeExpressionContextPhrase(contextTable.ctx_next_query, lastQuery,
+                                                     describer.describeQuery(lastQuery)));
+        }
+
+        const action = next.stmt.last;
+        if (action.schema!.functionType === 'action') {
+            assert(action instanceof Ast.InvocationExpression);
+            phrases.push(makeExpressionContextPhrase(contextTable.ctx_next_action, action,
+                                                     describer.describePrimitive(action.invocation)));
+        }
+    }
+
     if (ctx.isMultiDomain)
-        tags.push('ctx_multidomain');
+        phrases.push(makeContextPhrase(contextTable.ctx_multidomain, ctx));
 
     if (ctx.nextInfo !== null) {
-        tags.push('ctx_with_action');
+        phrases.push(makeContextPhrase(contextTable.ctx_with_action, ctx));
 
         if (!ctx.nextInfo.isComplete)
-            tags.push('ctx_incomplete_action');
+            phrases.push(makeContextPhrase(contextTable.ctx_incomplete_action, ctx));
     } else {
         if (ctx.resultInfo && ctx.resultInfo.isTable)
-            tags.push('ctx_without_action');
+            phrases.push(makeContextPhrase(contextTable.ctx_without_action, ctx));
     }
     if (!ctx.resultInfo || ctx.resultInfo.hasEmptyResult)
-        return tags;
+        return phrases;
 
     assert(ctx.results && ctx.results.length > 0);
-    tags.push('ctx_with_result');
+    phrases.push(makeContextPhrase(contextTable.ctx_with_result, ctx));
     if (ctx.resultInfo.isTable)
-        tags.push('ctx_with_table_result');
+        phrases.push(makeContextPhrase(contextTable.ctx_with_table_result, ctx));
     if (ctx.resultInfo.isAggregation)
-        tags.push('ctx_with_aggregation_result');
+        phrases.push(makeContextPhrase(contextTable.ctx_with_aggregation_result, ctx));
 
     if (ctxCanHaveRelatedQuestion(ctx))
-        tags.push('ctx_for_related_question');
+        phrases.push(makeContextPhrase(contextTable.ctx_for_related_question, ctx));
     if (isUserAskingResultQuestion(ctx)) {
-        tags.push('ctx_with_result_question');
+        phrases.push(makeContextPhrase(contextTable.ctx_with_result_question, ctx));
     } else {
         if (ctx.resultInfo.argMinMaxField)
-            tags.push('ctx_with_result_argminmax');
+            phrases.push(makeContextPhrase(contextTable.ctx_with_result_argminmax, ctx));
         else
-            tags.push('ctx_with_result_noquestion');
+            phrases.push(makeContextPhrase(contextTable.ctx_with_result_noquestion, ctx));
         if (ctx.nextInfo)
-            tags.push('ctx_with_result_and_action');
+            phrases.push(makeContextPhrase(contextTable.ctx_with_result_and_action, ctx));
 
         if (ctx.resultInfo.projection === null)
-            tags.push('ctx_without_projection');
+            phrases.push(makeContextPhrase(contextTable.ctx_without_projection, ctx));
     }
-    return tags;
+    return phrases;
 }
 
 export {
-    POLICY_NAME,
-    INITIAL_CONTEXT_INFO,
     makeAgentReply,
     setEndBit,
-
-    // compute derived information of the state
-    getContextInfo,
-    getContextTags,
-    tagContextForAgent,
-    isUserAskingResultQuestion,
 
     // manipulate states to create new states
     sortByName,

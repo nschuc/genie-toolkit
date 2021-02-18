@@ -43,6 +43,7 @@ import MultiJSONDatabase from './lib/multi_json_database';
 
 interface AnnotatorOptions {
     locale : string;
+    timezone : string|undefined;
     thingpedia : string;
     user_nlu_server : string;
     agent_nlu_server : string;
@@ -112,6 +113,7 @@ class Annotator extends events.EventEmitter {
         const simulatorOptions : ThingTalkUtils.SimulatorOptions = {
             rng: seedrandom.alea('almond is awesome'),
             locale: options.locale,
+            timezone: options.timezone,
             thingpediaClient: this._tpClient,
             schemaRetriever: this._schemas,
             overrides: this._simulatorOverrides,
@@ -260,8 +262,8 @@ class Annotator extends events.EventEmitter {
         await this._agentParser.start();
     }
     async stop() {
-        await this._userParser.start();
-        await this._agentParser.start();
+        await this._userParser.stop();
+        await this._agentParser.stop();
     }
 
     private async _learnThingTalk(code : string) {
@@ -416,7 +418,9 @@ class Annotator extends events.EventEmitter {
             this._extractSimulatorOverrides(currentTurn.agent!);
 
             // "execute" the context
-            [this._context, this._simulatorState] = await this._simulator.execute(this._context!, this._simulatorState);
+            const { newDialogueState, newExecutorState } = await this._simulator.execute(this._context!, this._simulatorState);
+            this._context = newDialogueState;
+            this._simulatorState = newExecutorState;
 
             // sort all results based on the presence of the name in the agent utterance
             for (const item of this._context!.history) {
@@ -471,7 +475,10 @@ class Annotator extends events.EventEmitter {
 
             let anyChange = true;
             while (anyChange) {
-                [this._context, this._simulatorState, anyChange] = await this._simulator.execute(this._context!, this._simulatorState);
+                const { newDialogueState, newExecutorState, anyChange: newAnyChange } = await this._simulator.execute(this._context!, this._simulatorState);
+                this._context = newDialogueState;
+                this._simulatorState = newExecutorState;
+                anyChange = newAnyChange;
                 if (anyChange)
                     this._outputTurn!.intermediate_context = this._context!.prettyprint();
             }
@@ -619,6 +626,11 @@ export function initArgparse(subparsers : argparse.SubParser) {
         required: false,
         default: 'en-US',
         help: `BGP 47 locale tag of the natural language being processed (defaults to en-US).`
+    });
+    parser.add_argument('--timezone', {
+        required: false,
+        default: undefined,
+        help: `Timezone to use to print dates and times (defaults to the current timezone).`
     });
     parser.add_argument('--thingpedia', {
         required: true,

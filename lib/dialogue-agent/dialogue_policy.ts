@@ -21,18 +21,17 @@
 
 import assert from 'assert';
 import * as Tp from 'thingpedia';
-import { Ast, Type, SchemaRetriever } from 'thingtalk';
+import { Ast, SchemaRetriever, Syntax } from 'thingtalk';
 
 import ValueCategory from './value-category';
-import { CancellationError } from './errors';
 import * as I18n from '../i18n';
-import SentenceGenerator from '../sentence-generator/generator';
+import SentenceGenerator, { SentenceGeneratorOptions } from '../sentence-generator/generator';
+import { AgentReplyRecord } from '../sentence-generator/types';
 import * as ThingTalkUtils from '../utils/thingtalk';
-import type DialogueLoop from './dialogue-loop';
-import type Conversation from './conversation';
+import { EntityMap } from '../utils/entity-utils';
 
 const MAX_DEPTH = 7;
-const TARGET_PRUNING_SIZES = [25, 50, 100];
+const TARGET_PRUNING_SIZES = [50, 100];
 
 let TEMPLATE_FILE_PATH : string;
 try {
@@ -64,18 +63,7 @@ function arrayEqual<T>(a : T[], b : T[]) : boolean {
     return true;
 }
 
-export interface AgentReplyRecord {
-    state : Ast.DialogueState,
-    tags : string[],
-    expect : Type|null,
-    end : boolean;
-    raw : boolean;
-}
-
-type FunctionTable = Map<string, (...args : any[]) => any>;
-type ContextInitializer = (previousTurn : Ast.DialogueState|null, functionTable : FunctionTable) => [string[], unknown]|null;
-
-interface GeneratorOptions {
+/*interface GeneratorOptions {
     locale : string;
     templateFiles : string[];
     flags : { [key : string] : boolean };
@@ -93,31 +81,43 @@ interface GeneratorOptions {
 
     contextual : true;
     contextInitializer : ContextInitializer;
+}*/
+
+interface DialoguePolicyOptions {
+    thingpedia : Tp.BaseClient;
+    schemas : SchemaRetriever;
+    locale : string;
+    timezone : string|undefined;
+
+    rng : () => number;
+    debug : boolean;
 }
 
 export default class DialoguePolicy {
-    private _dlg : DialogueLoop;
     private _thingpedia : Tp.BaseClient;
     private _schemas : SchemaRetriever;
     private _locale : string;
+    private _timezone : string|undefined;
     private _langPack : I18n.LanguagePack;
     private _rng : () => number;
+    private _debug : boolean;
 
-    private _sentenceGenerator : SentenceGenerator<Ast.DialogueState|null, AgentReplyRecord>|null;
+    private _sentenceGenerator : SentenceGenerator<Ast.DialogueState|null, Ast.DialogueState, AgentReplyRecord<Ast.DialogueState>>|null;
     private _generatorDevices : string[]|null;
-    private _generatorOptions : GeneratorOptions|undefined;
+    private _generatorOptions : SentenceGeneratorOptions<Ast.DialogueState|null, Ast.DialogueState>|undefined;
+    private _entityAllocator : Syntax.SequentialEntityAllocator;
 
-    constructor(dlg : DialogueLoop,
-                conversation : Conversation) {
-        this._dlg = dlg;
+    constructor(options : DialoguePolicyOptions) {
+        this._thingpedia = options.thingpedia;
+        this._schemas = options.schemas;
+        this._locale = options.locale;
+        this._timezone = options.timezone;
+        this._langPack = I18n.get(options.locale);
+        this._entityAllocator = new Syntax.SequentialEntityAllocator({});
 
-        this._thingpedia = conversation.thingpedia;
-        this._schemas = conversation.schemas;
-        this._locale = conversation.locale;
-        this._langPack = I18n.get(conversation.locale);
-
-        this._rng = conversation.rng;
+        this._rng = options.rng;
         assert(this._rng);
+        this._debug = options.debug;
 
         this._sentenceGenerator = null;
         this._generatorDevices = null;
@@ -130,34 +130,36 @@ export default class DialoguePolicy {
         this._generatorOptions = {
             contextual: true,
             rootSymbol: '$agent',
+            forSide: 'agent',
             flags: {
                 // FIXME
                 dialogues: true,
                 inference: true,
-                for_agent: true
             },
             rng: this._rng,
             locale: this._locale,
+            timezone: this._timezone,
             templateFiles: [TEMPLATE_FILE_PATH],
             thingpediaClient: this._thingpedia,
             schemaRetriever: this._schemas,
+            entityAllocator: this._entityAllocator,
             onlyDevices: forDevices,
             maxDepth: MAX_DEPTH,
             maxConstants: 5,
             targetPruningSize: TARGET_PRUNING_SIZES[0],
-            debug: this._dlg.hasDebug ? 2 : 1,
+            debug: this._debug ? 2 : 1,
 
-            contextInitializer(state, functionTable) {
+            contextInitializer: (state, functionTable, contextTable) => {
                 // ask the target language to extract the constants from the context
+                this._entityAllocator.reset();
                 if (state !== null) {
-                    const constants = ThingTalkUtils.extractConstants(state);
+                    const constants = ThingTalkUtils.extractConstants(state, this._entityAllocator);
                     sentenceGenerator.addConstantsFromContext(constants);
                 }
-                const tagger = functionTable.get('context')!;
-                return tagger(state);
+                return functionTable.context!(state, contextTable);
             }
         };
-        const sentenceGenerator = new SentenceGenerator<Ast.DialogueState|null, AgentReplyRecord>(this._generatorOptions!);
+        const sentenceGenerator = new SentenceGenerator<Ast.DialogueState|null, Ast.DialogueState, AgentReplyRecord<Ast.DialogueState>>(this._generatorOptions!);
         this._sentenceGenerator = sentenceGenerator;
         this._generatorDevices = forDevices;
         await this._sentenceGenerator.initialize();
@@ -189,7 +191,7 @@ export default class DialoguePolicy {
         if (state === null)
             return null;
         await this._ensureGeneratorForState(state);
-        return this._sentenceGenerator!.invokeFunction('answer', state, value);
+        return this._sentenceGenerator!.invokeFunction('answer', state, value, this._sentenceGenerator!.contextTable);
     }
 
     private _generateDerivation(state : Ast.DialogueState|null) {
@@ -206,17 +208,15 @@ export default class DialoguePolicy {
         return derivation;
     }
 
-    async chooseAction(state : Ast.DialogueState|null) : Promise<[Ast.DialogueState, ValueCategory|null, string]> {
+    async chooseAction(state : Ast.DialogueState|null) : Promise<[Ast.DialogueState, ValueCategory|null, string, EntityMap, number]|undefined> {
         await this._ensureGeneratorForState(state);
+
         const derivation = this._generateDerivation(state);
-        if (derivation === undefined) {
-            await this._dlg.fail();
-            throw new CancellationError();
-        }
+        if (derivation === undefined)
+            return derivation;
 
         let sentence = derivation.toString();
         sentence = this._langPack.postprocessSynthetic(sentence, derivation.value.state, this._rng, 'agent');
-        sentence = this._langPack.postprocessNLG(sentence, {});
 
         let expect : ValueCategory|null;
         if (derivation.value.end)
@@ -228,6 +228,6 @@ export default class DialoguePolicy {
         if (expect === ValueCategory.RawString && !derivation.value.raw)
             expect = ValueCategory.Command;
 
-        return [derivation.value.state, expect, sentence];
+        return [derivation.value.state, expect, sentence, this._entityAllocator.entities, derivation.value.numResults];
     }
 }

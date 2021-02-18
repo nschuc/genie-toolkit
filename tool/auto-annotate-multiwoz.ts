@@ -230,6 +230,7 @@ const USE_MANUAL_AGENT_ANNOTATION = true;
 
 interface ConverterOptions {
     locale : string;
+    timezone : string|undefined;
     thingpedia : string;
     database_file : string;
     user_nlu_server : string;
@@ -290,6 +291,7 @@ class Converter extends stream.Readable {
         const simulatorOptions : ThingTalkUtils.SimulatorOptions = {
             rng: seedrandom.alea('almond is awesome'),
             locale: 'en-US',
+            timezone: args.timezone,
             thingpediaClient: this._tpClient,
             schemaRetriever: this._schemas,
             overrides: this._simulatorOverrides,
@@ -742,7 +744,9 @@ class Converter extends stream.Readable {
                     this._extractSimulatorOverrides(agentUtterance);
 
                     // "execute" the context
-                    [context, simulatorState] = await this._simulator.execute(context, simulatorState);
+                    const { newDialogueState, newExecutorState } = await this._simulator.execute(context, simulatorState);
+                    context = newDialogueState;
+                    simulatorState = newExecutorState;
 
                     for (const item of context.history) {
                         if (item.results === null)
@@ -844,6 +848,11 @@ export function initArgparse(subparsers : argparse.SubParser) {
     parser.add_argument('-o', '--output', {
         required: true,
         type: fs.createWriteStream
+    });
+    parser.add_argument('--timezone', {
+        required: false,
+        default: undefined,
+        help: `Timezone to use to print dates and times (defaults to the current timezone).`
     });
     parser.add_argument('--thingpedia', {
         required: true,

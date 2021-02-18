@@ -20,7 +20,7 @@
 
 import * as argparse from 'argparse';
 import seedrandom from 'seedrandom';
-import * as fs from 'fs';
+import * as ThingTalk from 'thingtalk';
 import * as Tp from 'thingpedia';
 
 import SentenceGenerator, { SentenceGeneratorOptions } from "../lib/sentence-generator/generator";
@@ -120,10 +120,9 @@ export function initArgparse(subparsers : argparse.SubParser) {
   }
 
 export async function execute(args: any) {
-    let tpClient : Tp.FileClient | undefined = undefined;
-    if (args.thingpedia) tpClient = new Tp.FileClient(args);
+    const tpClient = new Tp.FileClient(args);
 
-    const options : SentenceGeneratorOptions<unknown> = {
+    const options = {
       rng: seedrandom.alea(args.random_seed),
       locale: args.locale,
       flags: args.flags || {},
@@ -136,7 +135,24 @@ export async function execute(args: any) {
       contextual: false,
     };
 
-    const generator = new SentenceGenerator(options);
+    const generator = new SentenceGenerator({
+            locale: options.locale,
+            timezone: undefined,
+            templateFiles: options.templateFiles,
+            forSide: 'user',
+            contextual: false,
+            flags: options.flags,
+            targetPruningSize: options.targetPruningSize,
+            maxDepth: options.maxDepth,
+            maxConstants: 5,
+            debug: options.debug,
+            rng: options.rng,
+
+            thingpediaClient: options.thingpediaClient,
+            entityAllocator: new ThingTalk.Syntax.SequentialEntityAllocator({}),
+            whiteList: options.whiteList
+        });
+
     await generator.initialize();
     generator.finalize();
 

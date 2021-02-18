@@ -27,9 +27,15 @@ import * as fs from 'fs';
 import { Ast, SchemaRetriever } from 'thingtalk';
 
 import SimulationDialogueAgent, { SimulationDialogueAgentOptions } from '../../dialogue-agent/simulator/simulation_dialogue_agent';
-import { computeNewState, computePrediction, prepareContextForPrediction } from '../../dialogue-agent/dialogue_state_utils';
 import { extractConstants, createConstants } from './constants';
+export * from './describe';
 export * from './syntax';
+export * from './dialogue_state_utils';
+import { computePrediction } from './dialogue_state_utils';
+export * from './example-utils';
+// reexport clean from misc-utils
+import { clean } from '../misc-utils';
+export { clean };
 
 export type Input = Ast.Input;
 export type DialogueState = Ast.DialogueState;
@@ -39,10 +45,6 @@ export type SimulatorOptions = SimulationDialogueAgentOptions;
 export {
     extractConstants,
     createConstants,
-
-    computeNewState,
-    computePrediction,
-    prepareContextForPrediction
 };
 
 function validateState(state : Ast.DialogueState, forTarget : 'user'|'agent') : void {
@@ -109,7 +111,7 @@ class StateValidator {
         if (!this._policy)
             return;
         assert.strictEqual(state.policy, this._policy.name);
-        assert(this._policy.dialogueActs.user.has(state.dialogueAct));
+        assert(this._policy.dialogueActs.user.has(state.dialogueAct), `Invalid user dialogue act ${state.dialogueAct}`);
         // if and only if
         assert((state.dialogueActParam !== null) === (this._policy.dialogueActs.withParam.has(state.dialogueAct)));
     }
@@ -120,8 +122,7 @@ class StateValidator {
         if (!this._policy)
             return;
         assert.strictEqual(state.policy, this._policy.name);
-        assert(this._policy.dialogueActs.user.has(state.dialogueAct));
-        assert(state.dialogueAct !== this._policy.terminalAct);
+        assert(this._policy.dialogueActs.agent.has(state.dialogueAct), `Invalid agent dialogue act ${state.dialogueAct}`);
         // if and only if
         assert((state.dialogueActParam !== null) === (this._policy.dialogueActs.withParam.has(state.dialogueAct)));
     }
@@ -129,4 +130,55 @@ class StateValidator {
 
 export function createStateValidator(policyManifest ?: string) : StateValidator {
     return new StateValidator(policyManifest);
+}
+
+interface DialoguePolicy {
+    handleAnswer(state : Ast.DialogueState, value : Ast.Value) : Promise<Ast.DialogueState|null>;
+}
+
+export async function inputToDialogueState(policy : DialoguePolicy,
+                                           context : Ast.DialogueState|null,
+                                           input : Ast.Input) : Promise<Ast.DialogueState|null> {
+    if (input instanceof Ast.ControlCommand) {
+        if (context === null)
+            return null;
+
+        if (input.intent instanceof Ast.SpecialControlIntent) {
+            switch (input.intent.type) {
+            case 'yes':
+            case 'no': {
+                const value = new Ast.BooleanValue(input.intent.type === 'yes');
+                const handled = await policy.handleAnswer(context, value);
+                if (!handled)
+                    return null;
+                return computePrediction(context, handled, 'user');
+            }
+            default:
+                return null;
+            }
+        }
+        if (input.intent instanceof Ast.ChoiceControlIntent)
+            return null;
+
+        if (input.intent instanceof Ast.AnswerControlIntent) {
+            const handled = await policy.handleAnswer(context, input.intent.value);
+            if (!handled)
+                return null;
+            return computePrediction(context, handled, 'user');
+        }
+
+        throw new TypeError(`Unrecognized bookkeeping intent`);
+    } else if (input instanceof Ast.Program) {
+        // convert thingtalk programs to dialogue states so we can use "\t" without too much typing
+        const prediction = new Ast.DialogueState(null, 'org.thingpedia.dialogue.transaction', 'execute', null, []);
+        for (const stmt of input.statements) {
+            if (stmt instanceof Ast.Assignment)
+                throw new Error(`Unsupported: assignment statement`);
+            prediction.history.push(new Ast.DialogueHistoryItem(null, stmt, null, 'accepted'));
+        }
+        return prediction;
+    }
+
+    assert(input instanceof Ast.DialogueState);
+    return input;
 }

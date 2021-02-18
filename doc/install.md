@@ -1,6 +1,6 @@
 # Installation Instructions
 
-Genie is hosted on [NPM](https://npmjs.com), and depends on nodejs >= 10.*.
+Genie is hosted on [NPM](https://npmjs.com), and depends on nodejs >= 12.*.
 
 ## Option 1: "git" install
 
@@ -32,8 +32,8 @@ suitable for integrating Genie in a larger project (such as Almond).
 ## Training
 
 To train a model, genie uses the [Genie NLP](https://github.com/stanford-oval/genienlp) library. To install it, use:
-```
-pip install genienlp
+```bash
+pip install 'genienlp>=0.6.0a1'
 ```
 
 After training, you should also prepare a directory to contain the embeddings.
