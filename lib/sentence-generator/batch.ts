@@ -122,7 +122,7 @@ class BasicSentenceGenerator extends stream.Readable {
     private _postprocessSentence(derivation : Derivation<ThingTalkUtils.Input>, program : ThingTalkUtils.Input) {
         let utterance = derivation.toString();
         utterance = utterance.replace(/ +/g, ' ');
-        utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
+        // utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
         return utterance;
     }
 

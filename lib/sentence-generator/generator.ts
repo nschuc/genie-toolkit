@@ -1428,9 +1428,10 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
                 let index = token.index;
 
                 for (let rule of this._rules[index]) {
+                    const expansionWithoutChoices = rule.expansion.map((c) => c instanceof Choice ? c.choices[0] : c);
                     let replaced = [
                     ...expansion.slice(0, i),
-                    ...rule.expansion,
+                    ...expansionWithoutChoices,
                     ...expansion.slice(i + 1),
                     ];
 
