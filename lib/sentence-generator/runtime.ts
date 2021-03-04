@@ -261,7 +261,7 @@ class Choice {
     }
 
     choose(rng : RNG) : string {
-        return uniform(this.choices, rng);
+        return this.choices[0];
     }
 
     toString() : string {

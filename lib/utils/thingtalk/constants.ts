@@ -144,7 +144,7 @@ function createConstants(tokenPrefix : string,
         entityAllocator.offsets[type] = Math.max(entityAllocator.offsets[type] || 0, index+1);
     }
 
-    for (let i = 0; i < MAX_CONSTANTS; i++) {
+    for (let i = 0; i < 1; i++) {
         switch (tokenPrefix) {
         case 'NUMBER':
             createConstant('NUMBER', i, new Ast.Value.Number(MAX_SMALL_INTEGER + 1 + i));
