@@ -140,7 +140,7 @@ class Derivation<ValueType> {
         assert(sentence instanceof List);
 
         this._flatSentence = null;
-        this.children = children;
+        this.children = children.map(c => c instanceof Derivation ? c.clone() : c);
         this.rule = rule
     }
 
@@ -182,6 +182,7 @@ class Derivation<ValueType> {
                 return new Derivation(newKey, newValue, List.singleton(children[0]), null, rulePriority, children, rule);
             }
         }
+
 
         let newSentence : List<string> = List.Nil;
         const values : unknown[] = [];
@@ -261,7 +262,7 @@ class Choice {
     }
 
     choose(rng : RNG) : string {
-        return this.choices[0];
+        return this.choices[0]
     }
 
     toString() : string {

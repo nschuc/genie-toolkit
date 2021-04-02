@@ -566,6 +566,7 @@ function makeMultiFieldProjection(loader : ThingpediaLoader,
         names.push(name);
     }
 
+    names.sort();
     if (ftype === 'table') {
         for (const pname of names) {
             if (isEqualityFilteredOnParameter(table, pname))

@@ -57,6 +57,7 @@ interface BasicGeneratorOptions {
     whiteList ?: string;
 
     saveHistory ?: boolean;
+    applyPostProcessing ?: boolean;
 }
 
 /**
@@ -71,6 +72,7 @@ class BasicSentenceGenerator extends stream.Readable {
     private _initialization : Promise<void>|null;
     private _i : number;
     private _saveHistory : boolean;
+    private _applyPostProcessing : boolean;
 
     constructor(options : BasicGeneratorOptions) {
         super({ objectMode: true });
@@ -79,6 +81,8 @@ class BasicSentenceGenerator extends stream.Readable {
         this._langPack = I18n.get(options.locale);
         this._rng = options.rng;
         this._saveHistory = options.saveHistory || false;
+        this._applyPostProcessing = options.applyPostProcessing || false;
+
         this._generator = new SentenceGenerator({
             locale: options.locale,
             timezone: options.timezone,
@@ -122,7 +126,9 @@ class BasicSentenceGenerator extends stream.Readable {
     private _postprocessSentence(derivation : Derivation<ThingTalkUtils.Input>, program : ThingTalkUtils.Input) {
         let utterance = derivation.toString();
         utterance = utterance.replace(/ +/g, ' ');
-        // utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
+        if(this._applyPostProcessing) {
+            utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
+        }
         return utterance;
     }
 
@@ -136,12 +142,6 @@ class BasicSentenceGenerator extends stream.Readable {
         const contextEntities = {};
         Utils.renumberEntities(tokenized, contextEntities);
         preprocessed = tokenized.tokens.join(' ');
-
-        let history = undefined;
-
-        if(this._saveHistory) {
-            history = JSON.stringify(this.flattenDerivation(derivation))
-        }
 
         let sequence;
         try {
@@ -157,22 +157,58 @@ class BasicSentenceGenerator extends stream.Readable {
             this.emit('error', e);
             return;
         }
+        sequence = sequence.join(' ')
+
         let id = String(this._i++);
         id = this._idPrefix + depth + '000000000'.substring(0,9-id.length) + id;
         const flags = {
             synthetic: true
         };
-        this.push({ depth, id, flags, preprocessed, history, target_code: sequence.join(' ') });
+
+        let history = undefined;
+        let reconstructedProgram
+        let reconstructedProgramSeq
+        let tree 
+        if(this._saveHistory) {
+            tree = this.serializeDerivation(derivation)
+            history = JSON.stringify(tree)
+            try {
+                reconstructedProgram = this._generator.programFromAST(tree);
+                reconstructedProgram = reconstructedProgram.optimize()
+                reconstructedProgramSeq = ThingTalkUtils.serializePrediction(program, [], entities, {
+                    locale: this._locale
+                });
+            } catch(e) {
+                console.log(entities)
+                console.log(history)
+                console.error(preprocessed);
+                console.error(String(reconstructedProgram));
+                console.error(sequence);
+
+                console.error(program.prettyprint().trim());
+                // this.emit('error', e);
+                return;
+            }
+            reconstructedProgramSeq = reconstructedProgramSeq.join(' ')
+        }
+
+
+        if(sequence !== reconstructedProgramSeq) {
+            console.log({sequence, reconstructedProgramSeq})
+        }
+
+        this.push({ depth, id, flags, preprocessed, history, target_code: sequence });
     }
 
-    flattenDerivation(derivation: DerivationChild<unknown>): any {
+    serializeDerivation(derivation: DerivationChild<unknown>): any {
         if(typeof derivation === 'string'){
             return derivation
         }
         else {
             return {
-                id: this._generator.nonTermList[derivation.rule?.symbolId || 0],
-                children: derivation.children.map(c => this.flattenDerivation(c))
+                nt: this._generator.nonTermList[derivation.rule?.symbolId || 0],
+                rule: derivation.rule?.number,
+                children: derivation.children.map(c => this.serializeDerivation(c))
             }
         }
     }

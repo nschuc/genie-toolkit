@@ -7,6 +7,7 @@ EXPOSE 8088
 ENV LANG=en_US.UTF-8
 RUN apt update && \
     apt install -y \
+        zip unzip gettext \
         ca-certificates supervisor openssh-server bash ssh \
         curl wget vim procps htop locales nano man net-tools iputils-ping && \
     sed -i "s/# en_US.UTF-8/en_US.UTF-8/" /etc/locale.gen && \
@@ -27,16 +28,7 @@ RUN apt update && \
 
 WORKDIR /usr/app
 
-RUN apt-get update && apt-get install -y \
-    zip unzip \
- && rm -rf /var/lib/apt/lists/*
-
-
 RUN npm install -g npm@7.5.2 node-pre-gyp thingpedia-cli
-
-ADD . .
-
-RUN npm install
 
 COPY --chown=13011:13011 --from=registry.console.elementai.com/shared.image/sshd:base /tk /tk
 RUN chmod 0600 /tk/etc/ssh/ssh_host_rsa_key

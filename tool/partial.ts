@@ -26,6 +26,8 @@ import * as Tp from 'thingpedia';
 import SentenceGenerator, { SentenceGeneratorOptions } from "../lib/sentence-generator/generator";
 import { ActionSetFlag } from './lib/argutils';
 import JsonDatagramSocket from '../lib/utils/json_datagram_socket';
+import * as Utils from '../lib/utils/entity-utils';
+import { ThingTalkUtils } from '../lib';
 
 export function initArgparse(subparsers : argparse.SubParser) {
     const parser = subparsers.add_parser("partial-completions", {
@@ -158,68 +160,41 @@ export async function execute(args: any) {
 
     let _stream = new JsonDatagramSocket(process.stdin!, process.stdout!, 'utf8');
 
+    generator.nextStepExpansion(['search for', 'a', {'nt': 'with_filtered_table'}])
+
     _stream.on('error', (e: any) => {
       console.error('Genie Error:', e)
     });
 
     _stream.on('data', (msg: any) => {
-      let expansions = generator.nextStepExpansion(msg.derivation);
-      _stream.write({
-        candidates: expansions?.map((e) => {
-          return e.map(token => token.toString())
-        }),
-      });
+      if(msg.partial){
+        let expansions = generator.nextStepExpansion(msg.partial);
+          _stream.write({
+            candidates: expansions,
+          });
+      } else {
+        let { derivation, sentence } = msg
+        try {
+          // console.warn("Attempting to serialize program:", JSON.stringify(derivation))
+          let program = generator.programFromAST(derivation);
+          program = program.optimize()
+          const tokens = sentence.split(' ');
+          const entities = Utils.makeDummyEntities(sentence);
+          program = ThingTalkUtils.serializePrediction(program, [], entities, {
+              locale: options.locale
+          });
+          program = program.join(' ')
+          _stream.write({ program });
+        }
+        catch(err) {
+          console.error("failed to parse program:", err)
+          _stream.write({ err });
+        }
+      }
     });
 
     await new Promise((resolve, reject) => {
       process.on('SIGINT', resolve);
       process.on('SIGTERM', resolve);
     });
-
   }
-
-// type Generator = SentenceGenerator<undefined, ThingTalkUtils.Input>;
-
-// class CommandLineHandler {
-
-//     private _rl : readline.Interface;
-//     private _generator: Generator: 
-//     private expansions : any;
-
-//   constructor(rl : readline.Interface, options: any) {
-  
-//     this._rl = rl;
-//     this._rl.on("line", this._onLine.bind(this));
-//     this._rl.on("SIGINT", this._quit.bind(this));
-//     this._generator = new SentenceGenerator(options);
-//   }
-
-//   async start() {
-//     await this._generator.initialize();
-//     this._generator.finalize();
-//     const startSymbol = "$root";
-//     this.expansions = this._generator.nextStepExpansion(startSymbol)
-//     this.printExpansions();
-//     this._rl.prompt();
-//   }
-
-//   printExpansions() {
-//     console.log("Select an expansion");
-//     for (let i = 0; i < this.expansions.length; i++) {
-//       console.log(`${i}: ${this.expansions[i]}`);
-//     }
-//   }
-
-//   async _quit() {
-//     console.log("Bye\n");
-//     this._rl.close();
-//   }
-
-//   async _onLine(line) {
-//     let index = parseInt(line);
-//     let expansion = this.expansions[index];
-//     this.expansions = this._generator.nextStepExpansion(expansion.toString())
-//     this.printExpansions();
-//     this._rl.prompt();
-//   }
-// }

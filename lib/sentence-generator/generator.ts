@@ -1411,39 +1411,134 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
         return tokens;
     }
 
-    nextStepExpansion(sentence: string[], expandAll: boolean = false) {
-        let expansion = this._parsePartialDerivation(sentence);
-        const anyNonTerm = expansion.some((x) => x instanceof NonTerminal);
+    programFromAST(tree: any) {
+        // lookup rule
+        if(typeof tree === 'string') {
+            return 
+        }
+        const nonTerminal = this._lookupNonTerminal(tree.nt)
+        const rule = this._rules[nonTerminal][tree.number]
 
-        if (!anyNonTerm) {
-            return;
+        const children = tree.children || []
+        const values = children.map((c: any) => this.programFromAST(c))
+        const value = rule.semanticAction(...values)
+        return value
         }
 
+    nextStepExpansion(expansion: Array<string | any>): any {
         let nextExpansions = [];
+
+        function isNonterminal(argument: RuleExpansionChunk): argument is NonTerminal {
+            return argument instanceof NonTerminal
+        }
 
         for (let i = 0; i < expansion.length; i++) {
             let token = expansion[i];
 
-            if (token instanceof NonTerminal) {
-                let index = token.index;
+            if(typeof token === 'string') { continue }
+            const nonTerminalIdx = this._lookupNonTerminal(token.nt)
 
-                for (let rule of this._rules[index]) {
-                    const expansionWithoutChoices = rule.expansion.map((c) => c instanceof Choice ? c.choices[0] : c);
-                    let replaced = [
+            const expansions = this._rules[nonTerminalIdx]
+                .filter(rule => {
+                    return !rule.expansion.filter(isNonterminal)
+                    .some(c => this._rules[c.index].length === 0)
+                })
+            
+            for (let rule of expansions) {
+                const expansionWithoutChoices = rule.expansion.map((c) => {
+                    if(c instanceof Choice) {
+                        return c.choices[0]
+                    }
+                    else if(c instanceof NonTerminal) {
+                        return { nt: c.symbol }
+                    }
+                    else {
+                        return c
+                    }
+                });
+                let replaced = [
                     ...expansion.slice(0, i),
                     ...expansionWithoutChoices,
                     ...expansion.slice(i + 1),
+                ].filter(v => v !== "")
+
+                nextExpansions.push({
+                    rule: {
+                        nt: token.nt,
+                        number: rule.number,
+                        children: expansionWithoutChoices,
+                    },
+                    expansion: replaced
+                });
+            }
+            break
+        }
+        return nextExpansions
+    }
+
+    nextStepExpansionTree(tree: any): any {
+        let nextExpansions = [];
+
+        function isNonterminal(argument: RuleExpansionChunk): argument is NonTerminal {
+            return argument instanceof NonTerminal
+        }
+
+        if(!tree.hasOwnProperty('rule')) {
+            const nonTerminalIdx = this._lookupNonTerminal(tree.nt)
+            for (let rule of this._rules[nonTerminalIdx]) {
+
+                let anyUnexpandableRules = rule.expansion.filter(isNonterminal)
+                    .some(c => this._rules[c.index].length === 0)
+
+                if(anyUnexpandableRules) {
+                    continue
+                }
+
+                const expansionWithoutChoices = rule.expansion.map((c) => {
+                    if(c instanceof Choice) {
+                        return c.choices[0]
+                    }
+                    else if(c instanceof NonTerminal) {
+                        return { nt: c.symbol }
+                    }
+                    else {
+                        return c
+                    }
+                });
+
+                nextExpansions.push({
+                    ...tree,
+                    children: expansionWithoutChoices,
+                    rule: rule.number
+                });
+            }
+            return nextExpansions
+        }
+
+        let children = tree.children;
+        for (let i = 0; i < children.length; i++) {
+            let child = children[i]
+            if (typeof child === 'string') {
+                continue
+            }
+            let expansions = this.nextStepExpansionTree(child)
+            for (let expansion of expansions) {
+                    let replaced = [
+                    ...children.slice(0, i),
+                    expansion,
+                    ...children.slice(i + 1),
                     ];
 
-                    nextExpansions.push(replaced);
+                nextExpansions.push({
+                    ...tree,
+                    children: replaced
+                });
                 }
-                if (!expandAll) {
+            if(expansions.length) {
                     break
                 }
             }
-        }
-
-        return nextExpansions;
+        return nextExpansions
     }
 }
 
