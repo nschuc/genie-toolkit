@@ -1,8 +1,8 @@
-// -*- mode: js; indent-tabs-mode: nil; js-basic-offset: 4 -*-
+// -*- mode: typescript; indent-tabs-mode: nil; js-basic-offset: 4 -*-
 //
 // This file is part of Genie
 //
-// Copyright 2019-2020 The Board of Trustees of the Leland Stanford Junior University
+// Copyright 2020-2021 The Board of Trustees of the Leland Stanford Junior University
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,19 +18,7 @@
 //
 // Author: Giovanni Campagna <gcampagn@cs.stanford.edu>
 
-
-import GenieNLP from './genienlp';
-
-const BACKENDS = {
-    'genienlp': GenieNLP
-};
-const DEFAULT_BACKEND = 'genienlp';
-
-export {
-    BACKENDS,
-    DEFAULT_BACKEND,
-};
-
-export function createJob(options) {
-    return new BACKENDS[options.backend || DEFAULT_BACKEND](options);
+export interface SimulationDatabase {
+    has(key : string) : boolean;
+    get(key : string) : Array<Record<string, unknown>>|undefined;
 }

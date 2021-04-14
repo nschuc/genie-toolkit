@@ -29,6 +29,7 @@ import MultiMap from '../utils/multimap';
 import { ReservoirSampler, } from '../utils/random';
 import * as Utils from '../utils/entity-utils';
 import * as ThingTalkUtils from '../utils/thingtalk';
+import { SimulationDatabase } from '../dialogue-agent/simulator/types';
 
 import SentenceGenerator, {
     SentenceGeneratorOptions,
@@ -37,7 +38,7 @@ import {
     ContextPhrase,
     AgentReplyRecord
 } from './types';
-import { Derivation, DerivationChild } from './runtime';
+import { Derivation } from './runtime';
 
 interface BasicGeneratorOptions {
     targetPruningSize : number;
@@ -124,7 +125,7 @@ class BasicSentenceGenerator extends stream.Readable {
     }
 
     private _postprocessSentence(derivation : Derivation<ThingTalkUtils.Input>, program : ThingTalkUtils.Input) {
-        let utterance = derivation.toString();
+        let utterance = derivation.sampleSentence(this._rng);
         utterance = utterance.replace(/ +/g, ' ');
         if(this._applyPostProcessing) {
             utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
@@ -150,10 +151,9 @@ class BasicSentenceGenerator extends stream.Readable {
             });
         } catch(e) {
             console.error(preprocessed);
-            console.error(String(program));
+            console.error(program.prettyprint().trim());
             console.error(sequence);
 
-            console.error(program.prettyprint().trim());
             this.emit('error', e);
             return;
         }
@@ -200,7 +200,7 @@ class BasicSentenceGenerator extends stream.Readable {
         this.push({ depth, id, flags, preprocessed, history, target_code: sequence });
     }
 
-    serializeDerivation(derivation: DerivationChild<unknown>): any {
+    serializeDerivation(derivation: Derivation<unknown>): any {
         if(typeof derivation === 'string'){
             return derivation
         }
@@ -208,7 +208,7 @@ class BasicSentenceGenerator extends stream.Readable {
             return {
                 nt: this._generator.nonTermList[derivation.rule?.symbolId || 0],
                 rule: derivation.rule?.number,
-                children: derivation.children.map(c => this.serializeDerivation(c))
+                children: derivation.children.map((c: Derivation<unknown>) => this.serializeDerivation(c))
             }
         }
     }
@@ -323,7 +323,7 @@ class MinibatchDialogueGenerator {
     private _postprocessSentence(derivation : Derivation<unknown>,
                                  program : ThingTalkUtils.DialogueState,
                                  forTarget : 'user'|'agent') : string {
-        let utterance = derivation.toString();
+        let utterance = derivation.sampleSentence(this._rng);
         utterance = utterance.replace(/ +/g, ' ');
         utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, forTarget);
         return utterance;
@@ -406,9 +406,15 @@ class MinibatchDialogueGenerator {
                     dlg.execState);
 
                 if (this._maybeAddPartialDialog(newDialogue)) {
-                    const { newDialogueState, newExecutorState } = await this._simulator.execute(userState, dlg.execState);
-                    newDialogue.context = newDialogueState;
-                    newDialogue.execState = newExecutorState;
+                    try {
+                        const { newDialogueState, newExecutorState } = await this._simulator.execute(userState, dlg.execState);
+                        newDialogue.context = newDialogueState;
+                        newDialogue.execState = newExecutorState;
+                    } catch(e) {
+                        console.error(`Failed to execute dialogue`);
+                        console.error(userState.prettyprint());
+                        throw e;
+                    }
                 }
             }
         }
@@ -460,11 +466,6 @@ class MinibatchDialogueGenerator {
                 yield dialogue;
         }
     }
-}
-
-interface SimulationDatabase {
-    has(key : string) : boolean;
-    get(key : string) : Array<{ [key : string] : unknown }>|undefined;
 }
 
 interface DialogueGeneratorOptions {

@@ -32,10 +32,9 @@ export * from './describe';
 export * from './syntax';
 export * from './dialogue_state_utils';
 import { computePrediction } from './dialogue_state_utils';
-export * from './example-utils';
-// reexport clean from misc-utils
-import { clean } from '../misc-utils';
-export { clean };
+// reexport clean, tokenizeExample from misc-utils
+import { clean, tokenizeExample } from '../misc-utils';
+export { clean, tokenizeExample };
 
 export type Input = Ast.Input;
 export type DialogueState = Ast.DialogueState;
@@ -92,7 +91,7 @@ class StateValidator {
         if (!this._policyManifest)
             return;
         const buffer = await util.promisify(fs.readFile)(this._policyManifest, { encoding: 'utf8' });
-        const policy = yaml.safeLoad(buffer) as any;
+        const policy = yaml.load(buffer) as any;
 
         this._policy = {
             name: policy.name,

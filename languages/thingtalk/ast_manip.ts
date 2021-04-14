@@ -350,7 +350,8 @@ function makeEdgeFilterStream(loader : ThingpediaLoader,
     if (outParams.length === 1 && loader.flags.turking)
         return null;
 
-    return new Ast.FilterExpression(null, new Ast.MonitorExpression(null, proj.expression, null, proj.expression.schema), f.ast, proj.expression.schema);
+    const monitor = new Ast.MonitorExpression(null, proj.expression, null, proj.expression.schema!.asType('stream'));
+    return new Ast.FilterExpression(null, monitor, f.ast, monitor.schema);
 }
 
 function addUnit(unit : string, num : Ast.VarRefValue | Ast.NumberValue) : Ast.Value {
@@ -408,8 +409,10 @@ function resolveProjection(schema : Ast.FunctionDef,
         argset.add(argname);
     for (const argname of argset) {
         const arg = schema.getArgument(argname);
-        if (!arg || arg.is_input)
+        if (!arg || arg.is_input) {
+            console.log(schema.prettyprint(), argname);
             throw new TypeError('Invalid field name ' + argname);
+        }
     }
     let clone = schema.filterArguments((a : Ast.ArgumentDef) => a.is_input || argset.has(a.name));
 
@@ -486,7 +489,7 @@ export function makeTypeBasedStreamProjection(table : Ast.Expression) : Ast.Proj
     if (pname === '$event')
         return null;
 
-    return makeProjection(new Ast.MonitorExpression(null, table, null, table.schema), pname);
+    return makeProjection(new Ast.MonitorExpression(null, table, null, table.schema!.asType('stream')), pname);
 }
 
 function isEqualityFilteredOnParameter(table : Ast.Expression, pname : string) : boolean {
@@ -537,7 +540,7 @@ function makeSingleFieldProjection(loader : ThingpediaLoader,
     } else {
         if (!table.schema!.is_monitorable)
             return null;
-        const stream = new Ast.MonitorExpression(null, table, null, table.schema);
+        const stream = new Ast.MonitorExpression(null, table, null, table.schema!.asType('stream'));
         return makeProjection(stream, pname);
     }
 }
@@ -575,7 +578,7 @@ function makeMultiFieldProjection(loader : ThingpediaLoader,
 
         return new Ast.ProjectionExpression(null, table, names, [], [], resolveProjection(table.schema!, names));
     } else {
-        const stream = new Ast.MonitorExpression(null, table, null, table.schema);
+        const stream = new Ast.MonitorExpression(null, table, null, table.schema!.asType('stream'));
         return new Ast.ProjectionExpression(null, stream, names, [], [], resolveProjection(stream.schema!, names));
     }
 }
@@ -889,6 +892,10 @@ function checkFilterUniqueness(table : Ast.Expression, filter : Ast.BooleanExpre
     if (filter instanceof Ast.ExternalBooleanExpression)
         return false;
 
+    if (filter instanceof Ast.ComparisonSubqueryBooleanExpression ||
+        filter instanceof Ast.ExistentialSubqueryBooleanExpression)
+        return false;
+
     if (filter instanceof Ast.NotBooleanExpression)
         return true;
 
@@ -1028,9 +1035,9 @@ function tableToStream(table : Ast.Expression) : Ast.Expression|null {
 
     let stream;
     if (table instanceof Ast.FilterExpression && !table.schema!.is_list)
-        stream = new Ast.FilterExpression(null, new Ast.MonitorExpression(null, table.expression, projArg, table.expression.schema), table.filter, table.expression.schema);
+        stream = new Ast.FilterExpression(null, new Ast.MonitorExpression(null, table.expression, projArg, table.expression.schema!.asType('stream')), table.filter, table.expression.schema!.asType('stream'));
     else
-        stream = new Ast.MonitorExpression(null, table, projArg, table.schema);
+        stream = new Ast.MonitorExpression(null, table, projArg, table.schema!.asType('stream'));
     return stream;
 }
 
@@ -1054,8 +1061,9 @@ function builtinSayAction(loader : ThingpediaLoader,
     }
 }
 
-function locationGetPredicate(loader : ThingpediaLoader,
-                              loc : Ast.Value, negate = false) : DomainIndependentFilterSlot|null {
+function locationSubquery(loader : ThingpediaLoader,
+                          loc : Ast.Value,
+                          negate = false) : DomainIndependentFilterSlot|null {
     if (!loader.standardSchemas.get_gps)
         return null;
 
@@ -1063,42 +1071,54 @@ function locationGetPredicate(loader : ThingpediaLoader,
     if (negate)
         filter = new Ast.BooleanExpression.Not(null, filter);
 
-    return { schema: null, ptype: null,
-        ast: new Ast.BooleanExpression.External(null, new Ast.DeviceSelector(null, 'org.thingpedia.builtin.thingengine.builtin',null,null),'get_gps', [], filter,
-            loader.standardSchemas.get_gps) };
+    const invocation = new Ast.Invocation(
+        null,
+        new Ast.DeviceSelector(null, 'org.thingpedia.builtin.thingengine.builtin', null, null),
+        'get_gps',
+        [],
+        loader.standardSchemas.get_gps
+    );
+    const subquery = new Ast.FilterExpression(null, new Ast.InvocationExpression(null, invocation, invocation.schema), filter, invocation.schema);
+    return { schema: null, ptype: null, ast: new Ast.BooleanExpression.ExistentialSubquery(null, subquery) };
 }
 
-function timeGetPredicate(loader : ThingpediaLoader,
-                          low : Ast.Value|null, high : Ast.Value|null) : DomainIndependentFilterSlot|null {
+function timeSubquery(loader : ThingpediaLoader,
+                      low : Ast.Value|null,
+                      high : Ast.Value|null) : DomainIndependentFilterSlot|null {
     if (!loader.standardSchemas.get_time)
         return null;
 
+    const invocation = new Ast.Invocation(
+        null,
+        new Ast.DeviceSelector(null, 'org.thingpedia.builtin.thingengine.builtin', null, null),
+        'get_time',
+        [],
+        loader.standardSchemas.get_time
+    );
     const operands = [];
-
     if (low)
         operands.push(new Ast.BooleanExpression.Atom(null, 'time', '>=', low));
     if (high)
         operands.push(new Ast.BooleanExpression.Atom(null, 'time', '<=', high));
     const filter = new Ast.BooleanExpression.And(null, operands);
-    return { schema: null, ptype: null,
-        ast: new Ast.BooleanExpression.External(null, new Ast.DeviceSelector(null, 'org.thingpedia.builtin.thingengine.builtin',null,null),'get_time', [], filter,
-            loader.standardSchemas.get_time) };
+    const subquery = new Ast.FilterExpression(null, new Ast.InvocationExpression(null, invocation, invocation.schema), filter, invocation.schema);
+    return { schema: null, ptype: null, ast: new Ast.BooleanExpression.ExistentialSubquery(null, subquery) };
 }
 
-function hasGetPredicate(filter : Ast.BooleanExpression) : boolean {
+function hasExistentialSubquery(filter : Ast.BooleanExpression) : boolean {
     if (filter instanceof Ast.AndBooleanExpression || filter instanceof Ast.OrBooleanExpression) {
         for (const op of filter.operands) {
-            if (hasGetPredicate(op))
+            if (hasExistentialSubquery(op))
                 return true;
         }
         return false;
     }
     if (filter instanceof Ast.NotBooleanExpression)
-        return hasGetPredicate(filter.expr);
-    return filter instanceof Ast.ExternalBooleanExpression;
+        return hasExistentialSubquery(filter.expr);
+    return filter instanceof Ast.ExistentialSubqueryBooleanExpression;
 }
 
-function makeGetPredicate(proj : Ast.Expression, op : string, value : Ast.Value, negate = false) : DomainIndependentFilterSlot|null {
+function makeExistentialSubquery(proj : Ast.Expression, op : string, value : Ast.Value, negate = false) : DomainIndependentFilterSlot|null {
     if (!(proj instanceof Ast.ProjectionExpression) || proj.args.length === 0)
         return null;
     if (!(proj.expression instanceof Ast.InvocationExpression))
@@ -1114,8 +1134,15 @@ function makeGetPredicate(proj : Ast.Expression, op : string, value : Ast.Value,
     const schema = proj.expression.invocation.schema!;
     if (!schema.out[arg].equals(value.getType()))
         return null;
-    return { schema: null, ptype: null,
-        ast: new Ast.BooleanExpression.External(null, selector, channel, proj.expression.invocation.in_params, filter, proj.expression.invocation.schema) };
+
+    const invocation = new Ast.Invocation(null, selector, channel, [], schema);
+    const subquery = new Ast.FilterExpression(
+        null,
+        new Ast.InvocationExpression(null, invocation, schema),
+        filter,
+        schema
+    );
+    return { schema: null, ptype: null, ast: new Ast.BooleanExpression.ExistentialSubquery(null, subquery) };
 }
 
 export function resolveChain(expressions : Ast.Expression[]) : Ast.FunctionDef {
@@ -1131,70 +1158,6 @@ export function resolveChain(expressions : Ast.Expression[]) : Ast.FunctionDef {
     clone.is_monitorable = expressions.every((exp) => exp.schema!.is_monitorable);
 
     return clone;
-}
-
-function filterTableJoin(into : Ast.Expression, filteredTable : Ast.Expression|null) : Ast.Expression|null {
-    // FIXME joins need to use subqueries not chains, otherwise parameters won't be available
-    return null;
-
-    /*
-    if (filteredTable === null)
-        return null;
-    if (!(filteredTable instanceof Ast.FilterExpression))
-        return null;
-    let tableName;
-    for (const [, invocation] of filteredTable.iteratePrimitives(false))
-        tableName = invocation.channel;
-    let passign;
-    for (const arg of into.schema!.iterateArguments()) {
-        if (arg.name !== 'id' && arg.type instanceof Type.Entity && arg.type.type.substring(arg.type.type.indexOf(':') + 1) === tableName)
-            passign = arg;
-    }
-    if (!passign)
-        return null;
-
-    const newSchema = resolveChain(filteredTable.schema!, into.schema!);
-
-    // TODO this should be a subquery not a chain expression
-
-    const join = new Ast.ChainExpression(null, [filteredTable, into], newSchema);
-    const filter = new Ast.BooleanExpression.Atom(null,
-        passign.name, '==', new Ast.Value.VarRef('id')
-    );
-    return new Ast.FilterExpression(null, join, filter, newSchema);
-    */
-}
-
-function arrayFilterTableJoin(into : Ast.Expression, filteredTable : Ast.Expression|null) : Ast.Expression|null {
-    // FIXME joins need to use subqueries not chains, otherwise parameters won't be available
-    return null;
-
-    /*
-    if (filteredTable === null)
-        return null;
-    if (!(filteredTable instanceof Ast.FilterExpression))
-        return null;
-    let tableName;
-    for (const [, invocation] of filteredTable.iteratePrimitives(false))
-        tableName = invocation.channel;
-    let passign;
-    for (const arg of into.schema!.iterateArguments()) {
-        if (arg.type instanceof Type.Array && arg.type.elem instanceof Type.Entity && arg.type.elem.type.substring(arg.type.elem.type.indexOf(':') + 1) === tableName)
-            passign = arg;
-    }
-    if (!passign)
-        return null;
-
-    const newSchema = resolveChain(filteredTable.schema!, into.schema!);
-
-    // TODO this should be a subquery not a chain expression
-
-    const join = new Ast.ChainExpression(null, [filteredTable, into], newSchema);
-    const filter = new Ast.BooleanExpression.Atom(null,
-        passign.name, 'contains', new Ast.Value.VarRef('id')
-    );
-    return new Ast.FilterExpression(null, join, filter, newSchema);
-    */
 }
 
 export function makeChainExpression(first : Ast.Expression, second : Ast.Expression) {
@@ -1370,92 +1333,66 @@ function hasConflictParam(table : Ast.Expression, pname : string, operation : st
     return null;
 }
 
-function maybeGetIdFilter(filter : Ast.BooleanExpression) : Ast.Value|undefined {
-    for (const atom of iterateFields(filter)) {
-        if (atom.name === 'id' && atom instanceof Ast.AtomBooleanExpression)
-            return atom.value;
+function maybeGetIdFilter(subquery : Ast.Expression) : Ast.Value|undefined {
+    for (const [, filter] of iterateFilters(subquery)) {
+        for (const atom of iterateFields(filter)) {
+            if (atom.name === 'id' && atom instanceof Ast.AtomBooleanExpression)
+                return atom.value;
+        }
     }
     return undefined;
 }
 
-function addReverseGetPredicateJoin(table : Ast.Expression,
-                                    get_predicate_table : Ast.Expression,
-                                    pname : string, negate = false) : Ast.Expression|null {
-    if (!(get_predicate_table instanceof Ast.InvocationExpression) &&
-        !(get_predicate_table instanceof Ast.FilterExpression &&
-          get_predicate_table.expression instanceof Ast.InvocationExpression))
-        return null;
-
-
-    const idType = table.schema!.getArgType('id');
+/**
+ * Find the argument in table2 that matches the id of table1
+ */
+function findMatchingArgument(table1 : Ast.Expression,
+                              table2 : Ast.Expression,
+                              pname : string|null) : Ast.ArgumentDef|null {
+    const idType = table1.schema!.getArgType('id');
     if (!idType || !idType.isEntity)
         return null;
-    let lhsArg = undefined;
-    assert(pname);
-    lhsArg = get_predicate_table.schema!.getArgument(pname);
-    if (!lhsArg)
-        return null;
-    if (!(lhsArg.type.equals(idType) ||
-        (lhsArg.type instanceof Type.Array && (lhsArg.type.elem as Type).equals(idType))))
-        return null;
-    if (lhsArg.name === 'id')
-        return null;
 
-    const invocation = get_predicate_table instanceof Ast.FilterExpression ? (get_predicate_table.expression as Ast.InvocationExpression).invocation : get_predicate_table.invocation;
-
-    const newAtom = new Ast.BooleanExpression.Atom(null, pname,
-        (lhsArg.type.isArray ? 'contains' : '=='),
-        new Ast.Value.VarRef('id'));
-    let get_predicate = new Ast.BooleanExpression.External(null,
-        invocation.selector,
-        invocation.channel,
-        invocation.in_params,
-        new Ast.BooleanExpression.And(null, [
-            get_predicate_table instanceof Ast.FilterExpression ? get_predicate_table.filter : Ast.BooleanExpression.True,
-            newAtom
-        ]),
-        invocation.schema
-    );
-    if (negate)
-        get_predicate = new Ast.BooleanExpression.Not(null, get_predicate);
-    return addFilterInternal(table, get_predicate, {});
-}
-
-function addGetPredicateJoin(table : Ast.Expression,
-                             get_predicate_table : Ast.Expression,
-                             pname : string|null,
-                             negate = false) : Ast.Expression|null {
-    if (!(get_predicate_table instanceof Ast.FilterExpression) ||
-        !(get_predicate_table.expression instanceof Ast.InvocationExpression))
-        return null;
-
-    const idType = get_predicate_table.schema!.getArgType('id');
-    if (!idType || !idType.isEntity)
-        return null;
-    let lhsArg = undefined;
+    let match = undefined;
     if (pname) {
-        lhsArg = table.schema!.getArgument(pname);
-        if (!lhsArg)
+        match = table2.schema!.getArgument(pname);
+        if (!match)
             return null;
-        if (!(lhsArg.type.equals(idType) ||
-            (lhsArg.type instanceof Type.Array && (lhsArg.type.elem as Type).equals(idType))))
+        if (!(match.type.equals(idType) ||
+            (match.type instanceof Type.Array && (match.type.elem as Type).equals(idType))))
             return null;
 
     } else {
-        for (const arg of table.schema!.iterateArguments()) {
+        for (const arg of table2.schema!.iterateArguments()) {
             if (arg.type.equals(idType) ||
                 (arg.type instanceof Type.Array && (arg.type.elem as Type).equals(idType))) {
-                lhsArg = arg;
-                break;
+                // in case multiple matches found and no pname specified, return null
+                if (match)
+                    return null;
+                match = arg;
             }
         }
-        if (!lhsArg)
+        if (!match)
             return null;
     }
-    if (lhsArg.name === 'id')
+    if (match.name === 'id')
         return null;
 
-    const idFilter = maybeGetIdFilter(get_predicate_table.filter);
+    return match;
+}
+
+// comparison subquery where the projection of subquery is on id
+// e.g., table filter pname == ([id] of subquery)
+function addComparisonSubquery(table : Ast.Expression,
+                               subquery : Ast.Expression,
+                               pname : string|null,
+                               negate = false) : Ast.Expression|null {
+    const lhsArg = findMatchingArgument(subquery, table, pname);
+    if (!lhsArg)
+        return null;
+
+    // in case where subquery already has a filter on id, replace the subquery with a simple atom filter
+    const idFilter = maybeGetIdFilter(subquery);
     if (idFilter) {
         if (idFilter.isString)
             return null;
@@ -1468,53 +1405,50 @@ function addGetPredicateJoin(table : Ast.Expression,
         return addFilterInternal(table, newAtom, {});
     }
 
-    let newAtom = new Ast.BooleanExpression.Atom(null, 'id', (lhsArg.type.isArray ? 'in_array' : '=='), new Ast.Value.VarRef(lhsArg.name));
-    if (negate)
-        newAtom = new Ast.BooleanExpression.Not(null, newAtom);
-    const get_predicate = new Ast.BooleanExpression.External(null,
-        get_predicate_table.expression.invocation.selector,
-        get_predicate_table.expression.invocation.channel,
-        get_predicate_table.expression.invocation.in_params,
-        new Ast.BooleanExpression.And(null, [get_predicate_table.filter, newAtom]),
-        get_predicate_table.expression.invocation.schema
+    // add id projection to subquery
+    subquery = subquery.clone();
+    if (subquery instanceof Ast.ProjectionExpression)
+        subquery.args = ['id'];
+    else
+        subquery = new Ast.ProjectionExpression(null, subquery, ['id'], [], [], subquery.schema);
+
+    const comparisonSubquery = new Ast.BooleanExpression.ComparisonSubquery(
+        null,
+        new Ast.Value.VarRef(lhsArg.name),
+        lhsArg.type.isArray ? 'contains' : '==',
+        subquery,
+        null
     );
-    return addFilterInternal(table, get_predicate, {});
+    const filter = negate ? new Ast.BooleanExpression.Not(null, comparisonSubquery) : comparisonSubquery;
+    return addFilterInternal(table, filter, {});
 }
 
-function addArrayJoin(lhs : Ast.Expression, rhs : Ast.Expression) : Ast.Expression|null {
-    // FIXME joins need to use subqueries not chains, otherwise parameters won't be available
-    return null;
-
-    /*
-    if (!(lhs instanceof Ast.FilterExpression))
+// comparison subquery where the lhs is the id of the main table
+// e.g., table filter id == ([pname] of subquery)
+function addReverseComparisonSubquery(table : Ast.Expression,
+                                      subquery : Ast.Expression,
+                                      pname : string|null, negate = false) : Ast.Expression|null {
+    const projection = findMatchingArgument(table, subquery, pname);
+    if (!projection)
         return null;
 
-    const idType = rhs.schema!.getArgType('id');
-    if (!idType || !idType.isEntity)
-        return null;
-    let lhsArg = undefined;
-    for (const arg of lhs.schema!.iterateArguments()) {
-        if (arg.type.equals(idType) ||
-            (arg.type instanceof Type.Array && (arg.type.elem as Type).equals(idType))) {
-            lhsArg = arg;
-            break;
-        }
-    }
-    if (!lhsArg)
-        return null;
-    if (lhsArg.name === 'id')
-        return null;
-    // if rhs has the same argument, lhsArg will be overridden
-    if (rhs.schema!.hasArgument(lhsArg.name))
-        return null;
+    // add id projection to subquery
+    if (subquery instanceof Ast.ProjectionExpression)
+        subquery.args = [projection.name];
+    else
+        subquery = new Ast.ProjectionExpression(null, subquery, [projection.name], [], [], subquery.schema);
 
-    const newSchema = resolveChain(lhs.schema!, rhs.schema!);
-    return new Ast.FilterExpression(null,
-        new Ast.ChainExpression(null, [lhs, rhs], newSchema),
-        new Ast.BooleanExpression.Atom(null, 'id', (lhsArg.type.isArray ? 'in_array' : '=='), new Ast.Value.VarRef(lhsArg.name)),
-        newSchema);
-    */
+    const comparisonSubquery = new Ast.BooleanExpression.ComparisonSubquery(
+        null,
+        new Ast.Value.VarRef('id'),
+        projection.type.isArray ? 'in_array' : '==',
+        subquery,
+        null
+    );
+    const filter = negate ? new Ast.BooleanExpression.Not(null, comparisonSubquery) : comparisonSubquery;
+    return addFilterInternal(table, filter, {});
 }
+
 
 function makeComputeExpression(table : Ast.Expression,
                                operation : string,
@@ -1553,10 +1487,9 @@ function makeComputeFilterExpression(table : Ast.Expression,
 function makeWithinGeoDistanceExpression(table : Ast.Expression, location : Ast.Value, filterValue : Ast.Value) : Ast.Expression|null {
     if (!table.schema!.out.geo || !table.schema!.out.geo.isLocation)
         return null;
-    const filterType = filterValue.getType();
-    if (!(filterType instanceof Type.Measure))
+    if (!(filterValue instanceof Ast.Value.Measure))
         return null;
-    const unit = filterType.unit;
+    const unit = filterValue.unit;
     assert(unit);
     if (Units.normalizeUnit(unit) !== 'm')
         return null;
@@ -1860,6 +1793,7 @@ export {
     getFunctions,
     getInvocation,
     adjustDefaultParameters,
+    hasConflictParam,
 
     // constants
     addUnit,
@@ -1868,8 +1802,8 @@ export {
 
     // builtins
     builtinSayAction,
-    locationGetPredicate,
-    timeGetPredicate,
+    locationSubquery,
+    timeSubquery,
 
     makeProgram,
     combineStreamCommand,
@@ -1887,9 +1821,13 @@ export {
     makeAggregateFilterWithFilter,
     checkFilter,
     addFilter,
-    hasGetPredicate,
-    makeGetPredicate,
     findFilterExpression,
+
+    // subquery
+    hasExistentialSubquery,
+    makeExistentialSubquery,
+    addComparisonSubquery,
+    addReverseComparisonSubquery,
 
     makeListExpression,
     makeSortedTable,
@@ -1907,11 +1845,6 @@ export {
     makeEdgeFilterStream,
     tableToStream,
 
-    // joins
-    filterTableJoin,
-    arrayFilterTableJoin,
-    hasConflictParam,
-
     // compute expressions
     makeComputeExpression,
     makeComputeFilterExpression,
@@ -1923,8 +1856,4 @@ export {
 
     iterateFilters,
     iterateFields,
-
-    addGetPredicateJoin,
-    addReverseGetPredicateJoin,
-    addArrayJoin,
 };

@@ -24,7 +24,7 @@ import * as readline from 'readline';
 import Engine from '../lib/engine';
 import Platform from './lib/cmdline-platform';
 
-const THINGPEDIA_URL = 'https://almond-dev.stanford.edu/thingpedia';
+const THINGPEDIA_URL = 'https://dev.almond.stanford.edu/thingpedia';
 const NL_SERVER_URL = 'https://nlp-staging.almond.stanford.edu';
 
 class LocalUser {
@@ -248,7 +248,7 @@ export function initArgparse(subparsers) {
 }
 
 export async function execute(args) {
-    const platform = new Platform(args.workdir, args.locale, args.thingpediaUrl);
+    const platform = new Platform(args.workdir, args.locale, args.thingpedia_url);
     const prefs = platform.getSharedPreferences();
     if (args.thingpedia_dir && args.thingpedia_dir.length)
         prefs.set('developer-dir', args.thingpedia_dir);

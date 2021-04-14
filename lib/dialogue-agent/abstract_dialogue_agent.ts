@@ -20,6 +20,7 @@
 
 
 import assert from 'assert';
+import * as Tp from 'thingpedia';
 import { Ast, SchemaRetriever } from 'thingtalk';
 
 import * as I18n from '../i18n';
@@ -37,10 +38,19 @@ interface AbstractDialogueAgentOptions {
     debug : boolean;
 }
 
-type RawExecutionResult = Array<[string, Record<string, unknown>]>;
+export interface NewProgramRecord {
+    uniqueId : string;
+    name : string;
+    code : string;
+    results : Array<Record<string, unknown>>;
+    errors : string[];
+    icon : string|null;
+}
+
+export type RawExecutionResult = Array<[string, Record<string, unknown>]>;
 interface AbstractStatementExecutor<PrivateStateType> {
     executeStatement(stmt : Ast.ExpressionStatement, privateState : PrivateStateType|undefined) :
-        Promise<[Ast.DialogueHistoryResultList, RawExecutionResult, PrivateStateType]>;
+        Promise<[Ast.DialogueHistoryResultList, RawExecutionResult, NewProgramRecord|undefined, PrivateStateType]>;
 }
 
 export interface DisambiguationHints {
@@ -55,10 +65,12 @@ export interface DeviceInfo {
     name : string;
 }
 
+
 interface ExecutionResult<PrivateStateType> {
     newDialogueState : Ast.DialogueState;
     newExecutorState : PrivateStateType|undefined;
     newResults : Array<[string, Record<string, unknown>]>;
+    newPrograms : NewProgramRecord[];
     anyChange : boolean;
 }
 
@@ -103,13 +115,15 @@ function expressionUsesIDFilter(expr : Ast.Expression) {
  * There are two subclasses, one used during simulation, and one used for execution.
  */
 export default abstract class AbstractDialogueAgent<PrivateStateType> {
+    protected _tpClient : Tp.BaseClient;
     protected _schemas : SchemaRetriever;
     protected _debug : boolean;
     private _langPack : I18n.LanguagePack;
     locale : string;
     timezone : string;
 
-    constructor(schemas : SchemaRetriever, options : AbstractDialogueAgentOptions) {
+    constructor(tpClient : Tp.BaseClient, schemas : SchemaRetriever, options : AbstractDialogueAgentOptions) {
+        this._tpClient = tpClient;
         this._schemas = schemas;
         this._langPack = I18n.get(options.locale);
 
@@ -135,6 +149,7 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
         let clone = state;
 
         const newResults : RawExecutionResult = [];
+        const newPrograms : NewProgramRecord[] = [];
         const hints = this._collectDisambiguationHintsForState(state);
         for (let i = 0; i < clone.history.length; i++) {
             if (clone.history[i].results !== null)
@@ -156,13 +171,15 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
                 continue;
             assert(clone.history[i].isExecutable());
 
-            const [newResultList, newRawResult, newPrivateState] = await this.executor.executeStatement(clone.history[i].stmt, privateState);
+            const [newResultList, newRawResult, newProgram, newPrivateState] = await this.executor.executeStatement(clone.history[i].stmt, privateState);
             clone.history[i].results = newResultList;
             newResults.push(...newRawResult);
+            if (newProgram)
+                newPrograms.push(newProgram);
             privateState = newPrivateState;
         }
 
-        return { newDialogueState: clone, newExecutorState: privateState, newResults, anyChange };
+        return { newDialogueState: clone, newExecutorState: privateState, newResults, newPrograms, anyChange };
     }
 
     private _collectDisambiguationHintsForState(state : Ast.DialogueState) {
@@ -257,7 +274,6 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
      * Show a debug message.
      *
      * @param {any} msg - what to show
-     * @protected
      */
     debug(...args : unknown[]) : void {
         if (!this._debug)
@@ -366,14 +382,16 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
         if (value instanceof Ast.MeasureValue && value.unit.startsWith('default')) {
             const key = value.unit.substring('default'.length).toLowerCase();
             const preference = this.getPreferredUnit(key);
-            if (preference)
+            if (preference) {
                 value.unit = preference;
-
-            switch (key) {
-            case 'defaultTemperature':
-                value.unit = this._langPack.getDefaultTemperatureUnit();
-            default:
-                throw new TypeError('Unexpected default unit ' + value.unit);
+            } else {
+                switch (key) {
+                case 'defaultTemperature':
+                    value.unit = this._langPack.getDefaultTemperatureUnit();
+                    break;
+                default:
+                    throw new TypeError('Unexpected default unit ' + value.unit);
+                }
             }
         } else if (value instanceof Ast.LocationValue && value.value instanceof Ast.UnresolvedLocation) {
             slot.set(await this.lookupLocation(value.value.name, hints.previousLocations || []));
@@ -385,6 +403,16 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
             if (value.type === 'tt:email_address' || value.type === 'tt:phone_number' ||
                 value.type === 'tt:contact') {
                 slot.set(await contactSearch(this, value.type, value.display!));
+            } else if (value.type === 'tt:device') {
+                const candidates = await this._tpClient.searchDevice(value.display!);
+                const tokenizer = this._langPack.getTokenizer();
+                const resolved = getBestEntityMatch(value.display!, value.type, candidates.map((d) => ({
+                    value: d.primary_kind,
+                    name: d.name,
+                    canonical: tokenizer.tokenize(d.name).rawTokens.join(' ')
+                })));
+                value.value = resolved.value;
+                value.display = resolved.name;
             } else {
                 const candidates = (hints.idEntities ? hints.idEntities.get(value.type) : undefined)
                     || await this.lookupEntityCandidates(value.type, value.display!, hints);
@@ -416,7 +444,6 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
      *
      * @param {string} kind - the kind to check
      * @returns {Array<DeviceInfo>} - the list of configured devices
-     * @abstract
      */
     protected getAllDevicesOfKind(kind : string) : DeviceInfo[] {
         throw new TypeError('Abstract method');
@@ -507,8 +534,6 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
      * @param {string} entityDisplay - the display name of the entity look up
      * @param {any} hints - hints to use to resolve any ambiguity
      * @returns {ThingpediaEntity[]} - possible entities that match the given name, in Thingpedia API format
-     * @abstract
-     * @protected
      */
     protected async lookupEntityCandidates(entityType : string,
                                            entityDisplay : string,
@@ -522,8 +547,6 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
      *
      * @param {string} variable - the variable name to lookup, including the `$context.` prefix
      * @returns {thingtalk.Ast.Value} - the resolved value
-     * @abstract
-     * @protected
      */
     protected async resolveUserContext(variable : string) : Promise<Ast.Value> {
         throw new TypeError('Abstract method');
@@ -537,8 +560,6 @@ export default abstract class AbstractDialogueAgent<PrivateStateType> {
      * @param {string} type - the type of unit to retrieve (e.g. "temperature"), or undefined
      *   if the user has no preference
      * @returns {string} - the preferred unit
-     * @abstract
-     * @protected
      */
     getPreferredUnit(type : string) : string|undefined {
         throw new TypeError('Abstract method');

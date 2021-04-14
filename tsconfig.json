@@ -7,8 +7,8 @@
         "languages/**/*"
     ],
     "compilerOptions": {
-        "target": "es2018",
-        "lib": ["es2018"],
+        "target": "es2019",
+        "lib": ["es2019"],
         "module": "commonjs",
         "allowJs": true,
         "esModuleInterop": true,
@@ -23,9 +23,10 @@
         "declaration": true
     },
     "typedocOptions": {
-        "mode": "library",
         "out": "jsdoc",
-        "name": "Genie",
-        "readme": "README.md"
+        "readme": "README.md",
+        "includeVersion": true,
+        "excludeExternals": true,
+        "listInvalidSymbolLinks": true
     }
 }

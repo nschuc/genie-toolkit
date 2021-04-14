@@ -26,12 +26,11 @@ import * as Tp from 'thingpedia';
 async function testGetDateTime(engine) {
     const device = engine.devices.getDevice('thingengine-own-global');
 
-    const now = new Date;
-
     const [date] = await device.get_get_date();
     assert(date.date instanceof Date);
-    assert(date.date >= now);
-    assert(date.date <= now.getTime() + 10000);
+    assert.strictEqual(date.date.getHours(), 0);
+    assert.strictEqual(date.date.getMinutes(), 0);
+    assert.strictEqual(date.date.getSeconds(), 0);
 
     const [time] = await device.get_get_time();
     assert(time.time instanceof Tp.Value.Time);
@@ -40,8 +39,7 @@ async function testGetDateTime(engine) {
 async function testGetCommands(engine) {
     const device = engine.devices.getDevice('thingengine-own-global');
 
-    const devices = await device.get_device();
-    for (const d of devices) {
+    for await (const d of await device.get_device()) {
         assert(d.id instanceof Tp.Value.Entity);
         assert(typeof d.id.value === 'string');
         assert(typeof d.id.display === 'string');
@@ -51,21 +49,39 @@ async function testGetCommands(engine) {
 
     const result = await device.get_commands({ device: new Tp.Value.Entity('com.xkcd', 'tt:device', 'XKCD') });
 
-    for (let ex of result) {
+    for await (const ex of result) {
         assert(typeof ex.id === 'string');
         assert(typeof ex.device === 'string');
         assert(ex.program instanceof Tp.Value.Entity);
     }
 }
 
+async function checkRandom(device, low, high, expectedLow, expectedHigh) {
+    for (let _try = 0; _try < 1000; _try++) {
+        const [random] = await device.get_get_random_between({ low, high });
+        assert.strictEqual(typeof random.random, 'number');
+        assert(random.random >= expectedLow, `got number ${random.random} which is less than ${expectedLow}`);
+        assert(random.random <= expectedHigh, `got number ${random.random} which is more than ${expectedHigh}`);
+        assert.strictEqual(Math.floor(random.random), random.random);
+    }
+}
+
 async function testOtherBuiltins(engine) {
     const device = engine.devices.getDevice('thingengine-own-global');
 
-    const [random] = await device.get_get_random_between({ low: 0, high: 7 });
-    assert.strictEqual(typeof random.random, 'number');
-    assert(random.random >= 0);
-    assert(random.random <= 7);
-    assert.strictEqual(Math.floor(random.random), random.random);
+    await checkRandom(device, 0, 7, 0, 7);
+    await checkRandom(device, 7, 0, 0, 7);
+    await checkRandom(device, undefined, undefined, 1, 6);
+
+    await checkRandom(device, 2, undefined, 2, 7);
+    await checkRandom(device, 10, undefined, 10, 20);
+    await checkRandom(device, 100, undefined, 100, 200);
+    await checkRandom(device, -100, undefined, -100, 0);
+    await checkRandom(device, undefined, 1, 1, 1);
+    await checkRandom(device, undefined, 10, 1, 10);
+    await checkRandom(device, undefined, -2, -7, -2);
+    await checkRandom(device, undefined, -10, -20, -10);
+    await checkRandom(device, undefined, -100, -200, -100);
 }
 
 function testBuiltinsAreExpected(engine) {

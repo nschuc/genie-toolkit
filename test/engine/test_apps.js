@@ -136,16 +136,16 @@ async function testSimpleGet2(engine, icon = null) {
 
     assert.deepStrictEqual(output, {
         uniqueId: 'app-foo-get',
-        description: 'Get get data on test with count 2 and with size 10 byte.',
+        description: 'Get get data on test with count 2 and size 10 byte.',
         code: '@org.thingpedia.builtin.test.get_data(count=2, size=10byte);',
         icon: 'org.thingpedia.builtin.test',
         results:
            [ { raw: { data: '!!!!!!!!!!', count: 2, size: 10 },
                type: 'org.thingpedia.builtin.test:get_data',
-               formatted: ['!!!!!!!!!!'] },
+               formatted: ['The data is !!!!!!!!!!.', 'The count is 2.'] },
              { raw: { data: '""""""""""', count: 2, size: 10 },
                type: 'org.thingpedia.builtin.test:get_data',
-               formatted: ['""""""""""'] } ],
+               formatted: ['The data is """""""""".', 'The count is 2.'] } ],
         errors: []
     });
 }

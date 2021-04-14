@@ -87,7 +87,7 @@ export default class ExactMatcher {
     async load(filename : string) {
         let buffer;
         try {
-            const mmap = (await import('mmap-io')).default;
+            const mmap = (await import('@raygun-nickj/mmap-io')).default;
             const fd = await pfs.open(filename, 'r');
             const stats = await fd.stat();
             buffer = mmap.map(Math.ceil(stats.size / mmap.PAGESIZE) * mmap.PAGESIZE,

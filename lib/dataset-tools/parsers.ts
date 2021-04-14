@@ -30,6 +30,7 @@ export interface SentenceExample {
     id : string;
     flags : FlagUtils.SentenceFlags;
 
+    raw ?: string;
     context ?: string;
     preprocessed : string;
     target_code : string|string[];
@@ -172,9 +173,11 @@ export interface DialogueTurn {
     context : string|null;
     agent : string|null;
     agent_target : string|null;
+    agent_timestamp ?: Date;
     intermediate_context : string|null;
     user : string;
     user_target : string;
+    user_timestamp ?: Date;
     vote ?: string;
     comment ?: string;
 }
@@ -216,6 +219,8 @@ class DialogueSerializer extends Stream.Transform {
             if (i > 0) {
                 if (this._annotations)
                     this._pushMany(this._prefixLines(turn.context, 'C: '));
+                if (turn.agent_timestamp)
+                    this.push('#! timestamp: ' + turn.agent_timestamp.toISOString() + '\n');
                 this._pushMany(this._prefixLines(turn.agent, 'A: '));
                 if (this._annotations)
                     this._pushMany(this._prefixLines(turn.agent_target, 'AT: '));
@@ -229,6 +234,8 @@ class DialogueSerializer extends Stream.Transform {
                 this.push('#! comment: ' + lines[0] + '\n');
                 this._pushMany(this._prefixLines(lines.slice(1).join('\n'), '#!          '));
             }
+            if (turn.user_timestamp)
+                this.push('#! timestamp: ' + turn.user_timestamp.toISOString() + '\n');
             this._pushMany(this._prefixLines(turn.user, 'U: '));
             if (this._annotations)
                 this._pushMany(this._prefixLines(turn.user_target, 'UT: '));
@@ -254,8 +261,13 @@ class DialogueParser extends Stream.Transform {
     private _i : number;
     private _id : string|undefined;
     private _keySequence : Array<keyof DialogueTurn>;
+    private _ignoreErrors : boolean;
 
-    constructor({ withAnnotations = true, invertTurns = false } = {}) {
+    constructor({
+        withAnnotations = true,
+        invertTurns = false,
+        ignoreErrors = false
+    } = {}) {
         super({ objectMode: true });
 
         this._buffer = [];
@@ -267,6 +279,7 @@ class DialogueParser extends Stream.Transform {
             this._keySequence = KEY_SEQUENCE_INVERTED;
         else
             this._keySequence = KEY_SEQUENCE_WITHOUT_ANNOTATION;
+        this._ignoreErrors = ignoreErrors;
     }
 
     _transform(line : string, encoding : BufferEncoding, callback : (err ?: Error|null, data ?: DialogueTurn[]) => void) {
@@ -340,7 +353,7 @@ class DialogueParser extends Stream.Transform {
         let currentKey : keyof DialogueTurn|null = null;
         let text = '';
         for (const line of lines) {
-            let key : keyof DialogueTurn, newText;
+            let key : keyof DialogueTurn|'timestamp', newText;
             if (line.startsWith('A: ')) {
                 key = 'agent';
                 newText = line.substring(3).trim().normalize('NFKD');
@@ -359,6 +372,9 @@ class DialogueParser extends Stream.Transform {
             } else if (line.startsWith('#! vote: ')) {
                 key = 'vote';
                 newText = line.substring('#! vote: '.length).normalize('NFKD');
+            } else if (line.startsWith('#! timestamp: ')) {
+                key = 'timestamp';
+                newText = line.substring('#! timestamp: '.length).normalize('NFKD');
             } else if (line.startsWith('#! comment: ')) {
                 key = 'comment';
                 newText = line.substring('#! comment: '.length).normalize('NFKD');
@@ -366,6 +382,8 @@ class DialogueParser extends Stream.Transform {
                 key = 'comment';
                 newText = line.substring('#! '.length).normalize('NFKD');
             } else {
+                if (this._ignoreErrors)
+                    continue;
                 throw new Error(`malformed line ${line}, expected to start with C:, U:, A:, AT: or UT:`);
             }
 
@@ -375,6 +393,13 @@ class DialogueParser extends Stream.Transform {
             }
             if (key === 'comment') {
                 currentTurn.comment += newText + '\n';
+                continue;
+            }
+            if (key === 'timestamp') {
+                if (currentKey === 'user')
+                    currentTurn.user_timestamp = new Date(newText.trim());
+                else
+                    currentTurn.agent_timestamp = new Date(newText.trim());
                 continue;
             }
 
@@ -394,9 +419,19 @@ class DialogueParser extends Stream.Transform {
                 if (key === 'context' && this._keySequence[expect] === 'user')
                     key = 'intermediate_context';
 
+                if (this._ignoreErrors) {
+                    if (key === 'agent' && this._keySequence[expect] === 'context') {
+                        currentTurn.context = currentTurn.user_target;
+                        expect = (expect + 1) % this._keySequence.length;
+                    }
+                }
+
                 if (key !== 'intermediate_context') {
-                    if (key !== this._keySequence[expect])
+                    if (key !== this._keySequence[expect]) {
+                        if (this._ignoreErrors) // truncate the dialogue on errors, we'll drop the last turn
+                            break;
                         throw new Error(`malformed dialogue ${this._i}, expected ${this._keySequence[expect]}, saw ${key}`);
+                    }
                     expect = (expect + 1) % this._keySequence.length;
                 }
                 currentKey = key;
@@ -404,11 +439,16 @@ class DialogueParser extends Stream.Transform {
             text += newText + '\n';
         }
 
-        if (currentKey !== this._keySequence[this._keySequence.length-1])
-            throw new Error(`malformed dialogue ${this._i}, unterminated last turn`);
+        if (currentKey !== this._keySequence[this._keySequence.length-1]) {
+            if (!this._ignoreErrors)
+                throw new Error(`malformed dialogue ${this._i}, unterminated last turn`);
 
-        currentTurn[currentKey] = text.trim();
-        flushTurn();
+            // ignore the current turn entirely if it is unterminated and we're told to
+            // ignore errors
+        } else {
+            currentTurn[currentKey] = text.trim();
+            flushTurn();
+        }
 
         dlg.id = this._id || String(this._i);
         this._id = undefined;

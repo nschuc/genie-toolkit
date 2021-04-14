@@ -77,10 +77,6 @@ export interface ConversationDelegate {
     addMessage(msg : Message) : Promise<void>;
 }
 
-interface ResultLike {
-    toLocaleString(locale ?: string) : string;
-}
-
 export class DialogueTurnLog {
     private readonly _turn : DialogueTurn;
     private _done : boolean;
@@ -109,8 +105,12 @@ export class DialogueTurnLog {
         this._done = true;
     }
 
-    update(field : keyof DialogueTurn, value : string) {
+    update(field : Exclude<keyof DialogueTurn,'agent_timestamp'|'user_timestamp'>, value : string) {
         this._turn[field] = this._turn[field] ? this._turn[field] + '\n' + value : value;
+        if (field === 'user')
+            this._turn.user_timestamp = new Date;
+        else if (field === 'agent')
+            this._turn.agent_timestamp = new Date;
     }
 }
 
@@ -245,12 +245,12 @@ export default class Conversation extends events.EventEmitter {
         return this._engine.platform.timezone;
     }
 
-    get stats() : Statistics {
-        return this._stats;
+    get engine() : Engine {
+        return this._engine;
     }
 
-    get apps() {
-        return this._engine.apps;
+    get stats() : Statistics {
+        return this._stats;
     }
 
     get schemas() : ThingTalk.SchemaRetriever {
@@ -275,6 +275,7 @@ export default class Conversation extends events.EventEmitter {
 
     endRecording() {
         this._options.log = false;
+        this.dialogueFinished();
     }
 
     notify(appId : string, icon : string|null, outputType : string, outputValue : Record<string, unknown>) {
@@ -324,12 +325,47 @@ export default class Conversation extends events.EventEmitter {
     async addOutput(out : ConversationDelegate, replayHistory = true) {
         this._delegates.add(out);
         if (replayHistory) {
-            for (const msg of this._history)
-                await out.addMessage(msg);
+            for (const msg of this._history) {
+                try {
+                    await out.addMessage(msg);
+                } catch(e) {
+                    // delegate disappeared immediately (race condition)
+                    this._delegates.delete(out);
+                    return;
+                }
+            }
         }
     }
     async removeOutput(out : ConversationDelegate) {
         this._delegates.delete(out);
+    }
+
+    private _callDelegates(fn : (out : ConversationDelegate) => unknown) {
+        return Promise.all(Array.from(this._delegates).map(async (out) => {
+            try {
+                await fn(out);
+            } catch(e) {
+                // delegate disappeared (likely a disconnected websocket)
+                this._delegates.delete(out);
+            }
+        }));
+    }
+
+    async setHypothesis(hypothesis : string) : Promise<void> {
+        await this._callDelegates((out) => out.setHypothesis(hypothesis));
+    }
+
+    async sendAskSpecial() : Promise<void> {
+        const what = ValueCategory.toAskSpecial(this._expecting);
+
+        if (this._debug) {
+            if (what !== null && what !== 'generic')
+                console.log('Genie sends a special request');
+            else if (what !== null)
+                console.log('Genie expects an answer');
+        }
+
+        await this._callDelegates((out) => out.setExpected(what, this._context));
     }
 
     private async _addMessage(msg : Message) {
@@ -337,10 +373,14 @@ export default class Conversation extends events.EventEmitter {
         this._history.push(msg);
         if (this._history.length > 30)
             this._history.shift();
-        await Promise.all(Array.from(this._delegates).map((out) => out.addMessage(msg)));
+        await this._callDelegates((out) => out.addMessage(msg));
     }
 
     async handleCommand(command : string, platformData : PlatformData = {}) : Promise<void> {
+        // if the command is just whitespace, ignore it without even adding it to the history
+        if (!command.trim())
+            return;
+
         this.stats.hit('sabrina-command');
         this.emit('active');
         this._resetInactivityTimeout();
@@ -348,7 +388,7 @@ export default class Conversation extends events.EventEmitter {
         if (this._debug)
             console.log('Received assistant command ' + command);
 
-        return this._loop.handleCommand({ type: 'command', utterance: command, platformData });
+        await this._loop.handleCommand({ type: 'command', utterance: command, platformData });
     }
 
     async handleParsedCommand(root : any, title ?: string, platformData : PlatformData = {}) : Promise<void> {
@@ -406,43 +446,28 @@ export default class Conversation extends events.EventEmitter {
         return this._loop.handleCommand({ type: 'thingtalk', parsed, platformData });
     }
 
-    async setHypothesis(hypothesis : string) : Promise<void> {
-        await Promise.all(Array.from(this._delegates).map((out) => out.setHypothesis(hypothesis)));
-    }
-
-    async sendAskSpecial() : Promise<void> {
-        const what = ValueCategory.toAskSpecial(this._expecting);
-
-        if (this._debug) {
-            if (what !== null && what !== 'generic')
-                console.log('Genie sends a special request');
-            else if (what !== null)
-                console.log('Genie expects an answer');
-        }
-
-        await Promise.all(Array.from(this._delegates).map((out) => out.setExpected(what, this._context)));
-    }
-
     sendReply(message : string, icon : string|null) {
         if (this._debug)
             console.log('Genie says: ' + message);
         return this._addMessage({ type: MessageType.TEXT, text: message, icon });
     }
 
-    sendResult(message : ResultLike, icon : string|null) {
-        return this._addMessage({ type: MessageType.RESULT, text: message.toLocaleString(this._locale), result: message, icon });
-    }
-
-    sendPicture(url : string, icon : string|null) {
+    sendMedia(mediaType : 'picture'|'audio'|'video', url : string, alt : string|undefined, icon : string|null) {
         if (this._debug)
-            console.log('Genie sends picture: '+ url);
-        return this._addMessage({ type: MessageType.PICTURE, url, icon });
+            console.log('Genie sends ' + mediaType + ': '+ url);
+        return this._addMessage({ type: mediaType as MessageType.AUDIO|MessageType.VIDEO|MessageType.PICTURE, url, alt, icon });
     }
 
     sendRDL(rdl : RDL, icon : string|null) {
         if (this._debug)
             console.log('Genie sends RDL: '+ rdl.callback);
         return this._addMessage({ type: MessageType.RDL, rdl, icon });
+    }
+
+    sendSoundEffect(name : string, exclusive : boolean, icon : string|null) {
+        if (this._debug)
+            console.log('Genie sends sound effect: '+ name);
+        return this._addMessage({ type: MessageType.SOUND_EFFECT, name, exclusive, icon });
     }
 
     sendChoice(idx : number, title : string) {
@@ -463,6 +488,19 @@ export default class Conversation extends events.EventEmitter {
         if (this._debug)
             console.log('Almond sends link: '+ url);
         return this._addMessage({ type: MessageType.LINK, url, title });
+    }
+
+    sendNewProgram(program : {
+        uniqueId : string;
+        name : string;
+        code : string;
+        results : Array<Record<string, unknown>>;
+        errors : string[];
+        icon : string|null;
+    }) {
+        if (this._debug)
+            console.log('Almond executed new program: '+ program.uniqueId);
+        return this._addMessage({ type: MessageType.NEW_PROGRAM, ...program });
     }
 
     private get _lastDialogue() {
@@ -516,13 +554,15 @@ export default class Conversation extends events.EventEmitter {
         last.turn.comment = comment;
     }
 
-    updateLog(field : keyof DialogueTurn, value : string) {
-        let last = this._lastTurn;
-        if (!last || last.done) {
-            last = new DialogueTurnLog();
-            this.appendNewTurn(last);
+    updateLog(field : Exclude<keyof DialogueTurn,'agent_timestamp'|'user_timestamp'>, value : string) {
+        if (this.inRecordingMode) {
+            let last = this._lastTurn;
+            if (!last || last.done) {
+                last = new DialogueTurnLog();
+                this.appendNewTurn(last);
+            }
+            last.update(field, value);
         }
-        last.update(field, value);
     }
 
     async saveLog() {

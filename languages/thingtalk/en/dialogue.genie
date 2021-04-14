@@ -39,11 +39,13 @@ await $loader.init();
 // Declare key functions for contextual stuff
 keyfn = {
     S.ContextInfo : S.contextKeyFn,
+    S.NameList : S.nameListKeyFn,
+    S.ContextName : S.contextNameKeyFn,
     D.ActionSuccessPhraseWithResult : D.actionSuccessPhraseWithResultKeyFn,
-    D.NameList : D.nameListKeyFn,
     D.Recommendation : D.recommendationKeyFn,
     D.ListProposal : D.listProposalKeyFn,
     D.ResultPhrase : D.resultPhraseKeyFn,
+    D.DirectAnswerPhrase : D.directAnswerPhraseKeyFn,
     D.UserSearchQuestionForList : D.userSearchQuestionForListKeyFn,
     D.PreciseSearchQuestionAnswer : D.preciseSearchQuestionAnswerKeyFn,
     D.NegativeProposalReply : D.negativeProposalReplyKeyFn,
@@ -80,6 +82,7 @@ import './dlg/refinement.genie';
 import './dlg/related-questions.genie';
 import './dlg/search-questions.genie';
 import './dlg/slot-fill.genie';
+import './dlg/streams.genie';
 
 // declare contexts
 context : S.ContextInfo = {
@@ -99,11 +102,13 @@ context : S.ContextInfo = {
     ctx_with_result_noquestion,
     ctx_with_result_argminmax,
     ctx_without_projection,
+    ctx_with_notification,
     ctx_for_related_question,
 
     // phrases that describe the current context
     // (some are later because they use a different type)
     ctx_next_statement,
+    ctx_current_statement,
 
     // abstract result states (used to interpret user utterances)
     // these should be returned by S.tagContextForAgent()
@@ -128,6 +133,11 @@ context : S.ContextInfo = {
     ctx_incomplete_action_after_search,
     ctx_learn_more,
     ctx_display_nonlist_result,
+    ctx_rule_enable_success,
+    ctx_action_notification,
+    ctx_list_notification,
+    ctx_nonlist_notification,
+    ctx_notification_error,
 
     // agent states (used to continue the conversation with more user utterances)
     // these more or less map to the agent dialogue acts, except we don't distinguish
@@ -158,8 +168,20 @@ context : Ast.Expression = {
 context : SlotBag = {
     ctx_thingpedia_result
 };
+context : D.ThingpediaListProposal = {
+    ctx_thingpedia_list_result
+};
 context : C.ErrorMessage = {
     ctx_thingpedia_error_message
+};
+context : S.NameList = {
+    ctx_result_name_list
+};
+context : S.ContextName = {
+    ctx_result_name
+};
+context : Ast.Value = {
+    ctx_notification_app_name
 };
 
 // map a concrete dialogue state (produced by the simulation or the neural network)
@@ -191,7 +213,7 @@ function answer(state : Ast.DialogueState, answer : Ast.Value, contextTable : Se
     const ctx = S.getContextInfo($loader, state, contextTable);
 
     // if the agent proposed something and the user says "yes", we accept the proposal
-    if (state.history[state.history.length-1].confirm === 'proposed' &&
+    if (state.history.length > 0 && state.history[state.history.length-1].confirm === 'proposed' &&
         answer instanceof Ast.BooleanValue && answer.value === true) {
         const item = state.history[state.history.length-1].clone();
         item.confirm = 'accepted';
@@ -239,6 +261,25 @@ function answer(state : Ast.DialogueState, answer : Ast.Value, contextTable : Se
     }
 }
 
+// handle notifications
+function notification(appName : string, program : Ast.Program, result : Ast.DialogueHistoryResultItem) {
+    assert(program.statements.length === 1);
+    const stmt = program.statements[0];
+    assert(stmt instanceof Ast.ExpressionStatement);
+
+    return new Ast.DialogueState(null, S.POLICY_NAME, 'notification', [new Ast.Value.String(appName)],
+        [new Ast.DialogueHistoryItem(null, stmt, new Ast.DialogueHistoryResultList(null, [result], new Ast.NumberValue(1), false), 'confirmed')]);
+}
+
+function notifyError(appName : string, program : Ast.Program, error : Ast.Value) {
+    assert(program.statements.length === 1);
+    const stmt = program.statements[0];
+    assert(stmt instanceof Ast.ExpressionStatement);
+
+    return new Ast.DialogueState(null, S.POLICY_NAME, 'notification', [new Ast.Value.String(appName)],
+        [new Ast.DialogueHistoryItem(null, stmt, new Ast.DialogueHistoryResultList(null, [], new Ast.NumberValue(1), false, error), 'confirmed')]);
+}
+
 $agent : S.AgentReplyRecord = {
     !inference {
         ( ctx:ctx_greet ('hello' | 'hi') ('!' | ',') ('how can i help you' | 'what are you interested in' | 'what can i do for you') '?'
@@ -253,23 +294,16 @@ $agent : S.AgentReplyRecord = {
         ) => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_greet', null));
     }
 
-    ?anything_else {
-        ctx:ctx_cancel anything_else_phrase
-            => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_anything_else', null));
+    ctx:ctx_cancel anything_else_phrase
+        => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_anything_else', null));
 
-        ctx:ctx_end 'alright ,' ('bye !' | 'good bye !')
-            => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_end', null));
-    }
-    !anything_else {
-        ( ctx:ctx_cancel 'alright ,' ('bye !' | 'good bye !')
-        | ctx:ctx_end 'alright ,' ('bye !' | 'good bye !')
-        ) => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_end', null));
-    }
+    ctx:ctx_end 'alright ,' ('bye !' | 'good bye !')
+        => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_end', null));
 
     // action results
     action_success_phrase;
-    ?anything_else action:action_success_phrase anything_else_phrase => S.setEndBit(action, false);
-    action_error_phrase;
+    action:action_success_phrase anything_else_phrase => S.setEndBit(action, false);
+    ctx:ctx_completed_action_error sorry_preamble phrase:action_error_phrase => phrase;
 
     // query results
     ctx:ctx_display_nonlist_result proposal:system_nonlist_result
@@ -307,6 +341,17 @@ $agent : S.AgentReplyRecord = {
     // learn more
     ctx:ctx_learn_more system_learn_more
         => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_learn_more_what', null));
+
+    ["${preamble} I {will|am going to} ${stmt}"]: (ctx : ctx_rule_enable_success, preamble : generic_excitement2_phrase, stmt : ctx_current_statement)
+        => S.makeAgentReply(ctx, S.makeSimpleState(ctx, 'sys_rule_enable_success', null));
+
+    // notification
+    ctx:ctx_list_notification notification_preamble proposal:system_recommendation
+        => D.makeRecommendationReply(ctx, proposal);
+    ctx:ctx_nonlist_notification notification_preamble proposal:system_nonlist_result
+        => D.makeDisplayResultReply(ctx, proposal);
+    action_notification_phrase;
+    ctx:ctx_notification_error notification_error_preamble phrase:action_error_phrase => phrase;
 }
 
 $user : Ast.DialogueState = {
@@ -315,21 +360,19 @@ $user : Ast.DialogueState = {
     ( ctx:ctx_init stmt:initial_command [weight=0.5]
     | ctx:ctx_init greeting stmt:initial_command [weight=0.5]
     | ctx:ctx_sys_greet stmt:initial_command
-    ) => D.initialRequest($loader, stmt);
+    ) => D.startNewRequest($loader, ctx, stmt);
 
     // do you need anything else?
     ( ctx:ctx_sys_anything_else no_thanks_phrase ('goodbye !' | '') [weight=0.01]
     | ctx:ctx_sys_anything_else thanks_phrase ('goodbye !' | '') [weight=0.01]
     ) => S.makeSimpleState(ctx, 'end', null);
 
-    ?anything_else {
-        ( ctx:ctx_sys_anything_else stmt:initial_command
-        | ctx:ctx_sys_anything_else yes_please_phrase stmt:initial_command
-        ) => D.startNewRequest($loader, ctx, stmt);
+    ( ctx:ctx_sys_anything_else stmt:initial_command
+    | ctx:ctx_sys_anything_else yes_please_phrase stmt:initial_command
+    ) => D.startNewRequest($loader, ctx, stmt);
 
-        ctx:ctx_sys_anything_else yes_please_phrase
-            => S.makeSimpleState(ctx, 'reinit', null);
-    }
+    ctx:ctx_sys_anything_else yes_please_phrase
+        => S.makeSimpleState(ctx, 'reinit', null);
 
     // action confirmations
     ctx:ctx_sys_confirm_action accept_phrase [weight=0.9]
@@ -454,4 +497,22 @@ $user : Ast.DialogueState = {
     ctx:ctx_sys_recommend_many questions:user_search_question_for_list with { functionName = ctx.currentFunction }
         => D.listProposalSearchQuestionReply(ctx, questions);
 
+    // streams
+    !nostream {
+        ctx:ctx_sys_action_success stream:add_separate_stream
+            => D.addStream(ctx, stream);
+        ctx:ctx_sys_recommend_one stream:add_separate_stream_to_query
+            => D.addStream(ctx, stream);
+        ctx:ctx_sys_recommend_many stream:add_separate_stream_to_query
+            => D.addStream(ctx, stream);
+        ctx:ctx_sys_display_result stream:add_separate_stream_to_query
+            => D.addStream(ctx, stream);
+
+        ctx:ctx_sys_recommend_one with { is_monitorable = true } make_monitor_phrase
+            => D.makeMonitor(ctx);
+        ctx:ctx_sys_recommend_many with { is_monitorable = true } make_monitor_phrase
+            => D.makeMonitor(ctx);
+        ctx:ctx_sys_display_result with { is_monitorable = true } make_monitor_phrase
+            => D.makeMonitor(ctx);
+    }
 }

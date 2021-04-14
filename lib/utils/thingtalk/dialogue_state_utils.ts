@@ -56,9 +56,6 @@ export function normalizeConfirmAnnotation(fndef : Ast.FunctionDef) : 'confirm'|
 }
 
 export function shouldAutoConfirmStatement(stmt : Ast.ExpressionStatement) : boolean {
-    if (stmt.stream)
-        return false;
-
     let needsConfirm = false;
     const visitor = new class extends Ast.NodeVisitor {
         visitInvocation(invocation : Ast.Invocation) : boolean {
@@ -111,8 +108,13 @@ export function computePrediction(oldState : Ast.DialogueState|null, newState : 
                 break;
 
             if (!oldItem.equals(newItem)) {
+                console.log('----');
+                console.log(oldState.prettyprint());
+                console.log(newState.prettyprint());
+                console.log('----');
                 console.log(oldItem.prettyprint());
                 console.log(newItem.prettyprint());
+                console.log('----');
                 console.log(oldItem);
                 console.log(newItem);
                 throw new Error(`Items unexpectedly different in computing prediction`);

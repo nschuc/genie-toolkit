@@ -24,6 +24,7 @@ import {
     DialogueEvaluatorStream,
     CollectDialogueStatistics
 } from './dialogue_evaluator';
+import SlotExtractor from './slot_extractor';
 
 /**
  * Classes related to evaluation of a model.
@@ -34,5 +35,6 @@ export {
     SentenceEvaluatorStream,
     CollectSentenceStatistics,
     DialogueEvaluatorStream,
-    CollectDialogueStatistics
+    CollectDialogueStatistics,
+    SlotExtractor
 };
