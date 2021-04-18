@@ -154,8 +154,8 @@ const CONTEXT_KEY_NAME = '$context';
 interface FunctionTable<StateType> {
     answer ?: (state : StateType, value : unknown, contextTable : ContextTable) => StateType|null;
     context ?: ContextFunction<StateType>;
-    notification ?: (appName : string, program : unknown, result : unknown, contextTable : ContextTable) => StateType|null;
-    notifyError ?: (appName : string, program : unknown, error : unknown, contextTable : ContextTable) => StateType|null;
+    notification ?: (appName : string|null, program : unknown, result : unknown, contextTable : ContextTable) => StateType|null;
+    notifyError ?: (appName : string|null, program : unknown, error : unknown, contextTable : ContextTable) => StateType|null;
 
     [key : string] : ((...args : any[]) => any)|undefined;
 }
@@ -668,7 +668,7 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
         let sentence;
         if (typeof sentenceTemplate === 'string') {
             try {
-                sentence = Replaceable.parse(sentenceTemplate).preprocess(this._options.locale, expansion.map((e) => e.name ?? e.symbol));
+                sentence = Replaceable.parse(sentenceTemplate).preprocess(this._langPack, expansion.map((e) => e.name ?? e.symbol));
             } catch(e) {
                 throw new GenieTypeError(`Failed to parse template string for ${symbol} = ${sentenceTemplate} (${expansion.join(', ')}): ${e.message}`);
             }
