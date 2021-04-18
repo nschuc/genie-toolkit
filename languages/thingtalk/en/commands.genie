@@ -349,8 +349,6 @@ projection_question : Ast.Expression = {
     | 'who is' proj:projection_Any with { projectionType = (new Type.Entity('tt:username')) } '?'
     | 'who is' proj:projection_Any with { projectionType = (new Type.Entity('tt:email_address')) } '?'
     ) => {
-        if (proj instanceof Ast.ProjectionExpression && proj.schema!.getArgType(proj.args[0]) instanceof Type.Array)
-            return null;
         return C.sayProjection($loader, proj);
     };
     ( 'what are' proj:projection_Any '?'
@@ -358,8 +356,6 @@ projection_question : Ast.Expression = {
     | 'who are' proj:projection_Any with { projectionType = (new Type.Entity('tt:username')) } '?'
     | 'who are' proj:projection_Any with { projectionType = (new Type.Entity('tt:email_address')) } '?'
     ) => {
-        if (proj instanceof Ast.ProjectionExpression && !(proj.schema!.getArgType(proj.args[0]) instanceof Type.Array))
-            return null;
         return C.sayProjection($loader, proj);
     };
     ('what' | 'which') proj:verb_projection_Any '?' => C.sayProjection($loader, proj);

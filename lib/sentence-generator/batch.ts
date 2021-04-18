@@ -38,7 +38,7 @@ import {
     ContextPhrase,
     AgentReplyRecord
 } from './types';
-import { Derivation } from './runtime';
+import { Derivation, ReplacedConcatenation } from './runtime';
 
 interface BasicGeneratorOptions {
     targetPruningSize : number;
@@ -125,7 +125,7 @@ class BasicSentenceGenerator extends stream.Readable {
     }
 
     private _postprocessSentence(derivation : Derivation<ThingTalkUtils.Input>, program : ThingTalkUtils.Input) {
-        let utterance = derivation.sampleSentence(this._rng);
+        let utterance = derivation.chooseBestSentence();
         utterance = utterance.replace(/ +/g, ' ');
         if(this._applyPostProcessing) {
             utterance = this._langPack.postprocessSynthetic(utterance, program, this._rng, 'user');
@@ -201,15 +201,17 @@ class BasicSentenceGenerator extends stream.Readable {
     }
 
     serializeDerivation(derivation: Derivation<unknown>): any {
-        if(typeof derivation === 'string'){
-            return derivation
+        let children;
+        if(derivation.children.length) {
+            children = derivation.children.map((c: Derivation<unknown>) => this.serializeDerivation(c))
         }
         else {
-            return {
-                nt: this._generator.nonTermList[derivation.rule?.symbolId || 0],
-                rule: derivation.rule?.number,
-                children: derivation.children.map((c: Derivation<unknown>) => this.serializeDerivation(c))
-            }
+            children = [ derivation.sentence.chooseBest() ]
+        }
+        return {
+            nt: this._generator.nonTermList[derivation.rule?.symbolId || 0],
+            number: derivation.rule?.number,
+            children
         }
     }
 }

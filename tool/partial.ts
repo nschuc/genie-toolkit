@@ -160,8 +160,6 @@ export async function execute(args: any) {
 
     let _stream = new JsonDatagramSocket(process.stdin!, process.stdout!, 'utf8');
 
-    generator.nextStepExpansion(['search for', 'a', {'nt': 'with_filtered_table'}])
-
     _stream.on('error', (e: any) => {
       console.error('Genie Error:', e)
     });
@@ -178,7 +176,6 @@ export async function execute(args: any) {
           // console.warn("Attempting to serialize program:", JSON.stringify(derivation))
           let program = generator.programFromAST(derivation);
           program = program.optimize()
-          const tokens = sentence.split(' ');
           const entities = Utils.makeDummyEntities(sentence);
           program = ThingTalkUtils.serializePrediction(program, [], entities, {
               locale: options.locale

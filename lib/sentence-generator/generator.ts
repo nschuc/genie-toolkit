@@ -1357,18 +1357,26 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
     }
 
     programFromAST(tree: any) {
-        // lookup rule
         if(typeof tree === 'string') {
             return 
         }
         const nonTerminal = this._lookupNonTerminal(tree.nt)
-        const rule = this._rules[nonTerminal][tree.rule]
+        const rule = this._rules[nonTerminal][tree.number]
 
         const children = tree.children || []
-        const values = children.map((c: any) => this.programFromAST(c))
-        const value = rule.semanticAction(...values)
-        return value
+        const values = children.map((c: any) => this.programFromAST(c)).filter((i: any) => i !== undefined)
+        try {
+            const value = rule.semanticAction(...values)
+            if(value === null) {
+                console.log("err")
+            }
+            return value
         }
+        catch(e){
+            console.log({values})
+            console.log(rule.semanticAction.toString())
+        }
+    }
 
     nextStepExpansion(expansion: Array<string | any>): any {
         let nextExpansions = [];
@@ -1379,20 +1387,16 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
             if(typeof token === 'string') { continue }
             const nonTerminalIdx = this._lookupNonTerminal(token.nt)
 
-            const expansions = this._rules[nonTerminalIdx]
-                .filter(rule => {
-                    return !rule.expansion.some(c => this._rules[c.index].length === 0)
-                })
-            
-            for (let rule of expansions) {
-                const expansionWithoutChoices = rule.expansion.map((c) => {
-                    if(c instanceof NonTerminal) {
-                        return { nt: c.symbol }
-                    }
+            for (let rule of this._rules[nonTerminalIdx]) {
+                let nonTerms = rule.expansion.map((c) => {
+                    return { nt: c.symbol }
                 });
+
+                let expandedRule = nonTerms.length ? nonTerms : [rule.sentence.replace({ replacements: [], constraints: {} })?.chooseBest()];
+
                 let replaced = [
                     ...expansion.slice(0, i),
-                    ...expansionWithoutChoices,
+                    ...expandedRule,
                     ...expansion.slice(i + 1),
                 ].filter(v => v !== "")
 
@@ -1400,7 +1404,7 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
                     rule: {
                         nt: token.nt,
                         number: rule.number,
-                        children: expansionWithoutChoices,
+                        children: expandedRule,
                     },
                     expansion: replaced
                 });
@@ -1424,7 +1428,7 @@ export default class SentenceGenerator<ContextType, StateType, RootOutputType = 
                 }
 
                 const expansionWithoutChoices = rule.expansion.map((c) => {
-                        return { nt: c.symbol }
+                    return { nt: c.symbol }
                 });
 
                 nextExpansions.push({
